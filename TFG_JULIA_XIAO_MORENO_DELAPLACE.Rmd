@@ -1,0 +1,2564 @@
+---
+title: "Sostenibilidad y comportamiento del consumidor en la última milla: el papel
+  del Click-and-Collect"
+author: "Júlia Xiao Moreno Delaplace"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    number_sections: true
+  pdf_document:
+    toc: true
+subtitle: Trabajo de Fin de Grado
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center", dpi = 300)
+Sys.setlocale("LC_ALL", "Spanish")
+```
+
+
+# Introducción y Preparación del Entorno
+
+## Carga de Librerías
+
+```{r}
+library(dplyr)    
+library(ggplot2) 
+library(pROC)         
+library(ResourceSelection) 
+library(broom)        
+library(margins)      
+library(rpart)        
+library(rpart.plot)   
+library(here)
+library(readr)
+library(tidyr)
+library(stringr)
+library(skimr)
+library(scales) 
+library(emmeans)
+library(gmodels)
+library(ggalluvial)
+library(corrplot)
+library(lavaan)
+library(semTools)
+library(psych)
+library(GGally)
+library(caret)
+library(car)
+library(likert)
+library(reshape2)
+library(ggeffects)
+```
+
+
+
+## Ingesta e Integración de Datos (ETL) y Armonización
+
+```{r}
+# Carga de datos brutos
+df_A <- read_delim(here("data", "Datos_2202012_A.csv"), delim = ";", locale = locale(decimal_mark = ","), show_col_types = FALSE)
+df_B <- read_delim(here("data", "Datos_2202012__B.csv"), delim = ";", locale = locale(decimal_mark = ","), show_col_types = FALSE)
+df_C <- read_delim(here("data", "Datos_2202012_C.csv"), delim = ";", locale = locale(decimal_mark = ","), show_col_types = FALSE)
+df_D <- read_delim(here("data", "Datos_2202012_D.csv"), delim = ";", locale = locale(decimal_mark = ","), show_col_types = FALSE)
+
+# Función de Armonización 
+preparar_escenario <- function(df, escenario, nivel_precio, nivel_cc) {
+  df_limpio <- df %>%
+    rename_with(~ str_replace(., paste0("^(P\\d+)", escenario), "\\1")) %>%
+    mutate(
+      escenario_id = escenario,
+      factor_precio = nivel_precio, 
+      factor_cc = nivel_cc          
+    )
+  
+  # Si son escenarios sin Click & Collect (A y B)
+  if (escenario %in% c("A", "B")) {
+    df_limpio <- df_limpio %>%
+      rename(
+        P6_1_intencion_tienda  = P6_1,
+        P6_3_intencion_online  = P6_2,
+        P9_espera_domicilio    = P8,   
+        P10_manipulation_check = P9,   
+        P11_realismo           = P10   
+      ) %>%
+      mutate(
+        P6_2_intencion_cc = NA_real_, 
+        P8_espera_cc = NA_real_)
+  } 
+  
+  # Si son escenarios con Click & Collect (C y D)
+  else if (escenario %in% c("C", "D")) {
+    df_limpio <- df_limpio %>%
+      rename(
+        P6_1_intencion_tienda  = P6_1,
+        P6_2_intencion_cc      = P6_2,
+        P6_3_intencion_online  = P6_3,
+        P8_espera_cc           = P8,
+        P9_espera_domicilio    = P9,
+        P10_manipulation_check = P10,
+        P11_realismo           = P11
+      ) %>%
+      mutate(
+        P8_espera_cc = as.numeric(P8_espera_cc),
+        P6_2_intencion_cc = as.numeric(P6_2_intencion_cc)
+      )
+  }
+  return(df_limpio)
+}
+
+# Fusión Vertical
+df_master <- bind_rows(
+  preparar_escenario(df_A, "A", "Baja", "No"),
+  preparar_escenario(df_B, "B", "Alta", "No"),
+  preparar_escenario(df_C, "C", "Baja", "Sí"),
+  preparar_escenario(df_D, "D", "Alta", "Sí")
+)
+
+```
+
+# Limpieza y Calidad del Dato (Data Quality)
+
+## Definición de la Clave Primaria y Limpieza de Metadatos
+
+```{r}
+df_analisis <- df_master %>%
+  filter(ESTADO == 1) %>% 
+  mutate(ID_global = paste(escenario_id, REGISTRO, sep = "_")) %>%
+  relocate(ID_global, .before = REGISTRO) %>%
+  rename(
+    S2_sexo = S2, 
+    S3_poblacion = S3, 
+    P1_habito_compra = P1, 
+    P2_habito_info = P2,
+    P5_eleccion_canal = P5, 
+    P7_cambio_canal = P7,
+    
+    # Gratificación Inmediata
+    P3_1_grat_inmed_1 = P3_1, 
+    P3_2_grat_inmed_2 = P3_2, 
+    P3_3_grat_inmed_3 = P3_3,
+    
+    # Sensibilidad al Precio
+    P4_1_sensib_precio_1 = P4_1, 
+    P4_2_sensib_precio_2 = P4_2, 
+    P4_3_sensib_precio_3 = P4_3, 
+    P4_4_sensib_precio_4 = P4_4,
+    
+    # Mala conciencia por Showrooming
+    P12_1_showrooming_1 = P12_1, 
+    P12_2_showrooming_2 = P12_2, 
+    P12_3_showrooming_3 = P12_3,
+    
+     # Conciencia Ambiental
+    P13_1_conciencia_ambiental_1 = P13_1, 
+    P13_2_conciencia_ambiental_2 = P13_2, 
+    P13_3_conciencia_ambiental_3 = P13_3
+  ) %>%
+  
+  # Eliminamos metadatos basura del software de encuestas
+  select(-c(ESTUDIO, ENTREVISTADOR, FECHAINI, HORAINI, FECHAFIN, HORAFIN, 
+            TELEFONO, EMAIL, ID_CONTACTO, ESTADO, IDIOMA, starts_with("IDGUID"), 
+            IDAPK, IDBROWSER, IDDEVICE, IDIP, IDMODE, IDMODEL, IDSCREEN, PP, IDEND))
+
+```
+
+## Perfilado Inicial de los Datos (Data Profiling)
+
+```{r}
+# Estructura de tipos de datos
+glimpse(df_analisis)
+
+# Resumen Estadístico 
+summary(df_analisis)
+
+# Calidad del Dato
+skim_without_charts(df_analisis)
+```
+
+
+
+# Transformación y Recodificación de Variables (Feature Engineering)
+
+## Recodificación de Factores y Target Binario Inicial
+
+```{r}
+df_analisis <- df_analisis %>%
+  # Cálculo de medias
+  mutate(
+    conciencia_ambiental_media = rowMeans(select(., starts_with("P13_")), na.rm = TRUE),
+    sensibilidad_precio_media  = rowMeans(select(., starts_with("P4_")), na.rm = TRUE),
+    gratificacion_media        = rowMeans(select(., starts_with("P3_")), na.rm = TRUE),
+    mala_conciencia_media      = rowMeans(select(., starts_with("P12_")), na.rm = TRUE)
+  ) %>%
+  # Recodificación de factores y target binario
+  mutate(
+    # Sociodemográficos
+    S2_sexo = factor(S2_sexo, 
+                     levels = c(1, 2), 
+                     labels = c("Femenino", "Masculino")),
+    CUOTA_EDAD = factor(CUOTA_EDAD, 
+                        levels = c(1, 2, 3), 
+                        labels = c("18-30", "31-50", "51-65")),
+    S3_poblacion = factor(S3_poblacion, 
+                          levels = 1:8, 
+                          labels = c("Menos de 5.000", "5.001-10.000", "10.001-25.000", 
+                                     "25.001-50.000", "50.001-100.000", "100.001-500.000", 
+                                     "Más de 500.000", "No lo sé")),
+    
+    # Diseño Experimental (Baselines)
+    factor_precio = factor(factor_precio, 
+                           levels = c("Baja", "Alta"), 
+                           labels = c("Diferencia Baja", "Diferencia Alta")),
+    factor_cc = factor(factor_cc, 
+                       levels = c("No", "Sí"), 
+                       labels = c("Sin C&C", "Con C&C")),
+    
+    # Target Binario
+    eleccion_sostenible = case_when(
+      # --- ESCENARIOS A y B ---
+      # 1 = Tienda (Sostenible)
+      escenario_id %in% c("A", "B") & P5_eleccion_canal %in% c("1", 1) ~ 1,  
+      # 2 = Domicilio (No Sostenible)
+      escenario_id %in% c("A", "B") & P5_eleccion_canal %in% c("2", 2) ~ 0,  
+      
+      # --- ESCENARIOS C y D ---
+      # 1 = Tienda, 2 = Click & Collect (Ambos Sostenibles)
+      escenario_id %in% c("C", "D") & P5_eleccion_canal %in% c("1", "2", 1, 2) ~ 1,  
+      # 3 = Domicilio (No Sostenible)
+      escenario_id %in% c("C", "D") & P5_eleccion_canal %in% c("3", 3) ~ 0,    
+      TRUE ~ NA_real_              
+    ),
+    eleccion_sostenible_factor = factor(eleccion_sostenible, levels = c(0, 1), 
+                                        labels = c("Domicilio (No Sost.)", "Física/C&C (Sost.)"))
+  )
+
+```
+
+## Creación de Constructos Psicológicos 
+
+```{r}
+df_analisis <- df_analisis %>%
+  mutate(
+    conciencia_ambiental_media = rowMeans(select(., starts_with("P13_")), na.rm = TRUE),
+    sensibilidad_precio_media  = rowMeans(select(., starts_with("P4_")), na.rm = TRUE),
+    gratificacion_media        = rowMeans(select(., starts_with("P3_")), na.rm = TRUE),
+    mala_conciencia_media      = rowMeans(select(., starts_with("P12_")), na.rm = TRUE))
+
+df_analisis <- df_analisis %>%
+  # Forzamos el desagrupado para que scale() opere sobre toda la muestra
+  dplyr::ungroup() %>% 
+  # Creamos las variables estandarizadas correctamente
+  dplyr::mutate(
+    z_conciencia_amb  = as.numeric(scale(conciencia_ambiental_media)),
+    z_sensib_precio   = as.numeric(scale(sensibilidad_precio_media)),
+    z_gratificacion   = as.numeric(scale(gratificacion_media)),
+    z_mala_conciencia = as.numeric(scale(mala_conciencia_media))
+  )
+
+# Seleccionamos las nuevas variables del dataframe limpio
+variables_z <- df_analisis %>% 
+  dplyr::select(z_conciencia_amb, z_sensib_precio, z_gratificacion, z_mala_conciencia)
+
+# Sacamos el descriptivo. 
+tabla_verificacion <- psych::describe(variables_z)
+print(round(tabla_verificacion, 2))
+```
+
+```{r}
+# Tabla resumen
+tabla_descriptivos <- df_analisis %>%
+  summarise(
+    # Conciencia Ambiental
+    Media_Orig_Amb = round(mean(conciencia_ambiental_media, na.rm = TRUE), 2),
+    SD_Orig_Amb    = round(sd(conciencia_ambiental_media, na.rm = TRUE), 2),
+    Media_Z_Amb    = round(mean(z_conciencia_amb, na.rm = TRUE), 2),
+    
+    # Sensibilidad al Precio
+    Media_Orig_Pre = round(mean(sensibilidad_precio_media, na.rm = TRUE), 2),
+    SD_Orig_Pre    = round(sd(sensibilidad_precio_media, na.rm = TRUE), 2),
+    Media_Z_Pre    = round(mean(z_sensib_precio, na.rm = TRUE), 2),
+    
+    # Gratificación Inmediata
+    Media_Orig_Gra = round(mean(gratificacion_media, na.rm = TRUE), 2),
+    SD_Orig_Gra    = round(sd(gratificacion_media, na.rm = TRUE), 2),
+    Media_Z_Gra    = round(mean(z_gratificacion, na.rm = TRUE), 2),
+    
+    # Mala Conciencia Showrooming
+    Media_Orig_Cul = round(mean(mala_conciencia_media, na.rm = TRUE), 2),
+    SD_Orig_Cul    = round(sd(mala_conciencia_media, na.rm = TRUE), 2),
+    Media_Z_Cul    = round(mean(z_mala_conciencia, na.rm = TRUE), 2)
+  )
+
+print(tabla_descriptivos)
+```
+
+
+## Clasificación de Persuasión (Diseño Intra-sujeto). 
+
+```{r}
+df_analisis <- df_analisis %>%
+  mutate(
+    # Pasamos todo a texto para evitar errores de clase en el case_when
+    P5_eleccion_canal = as.character(P5_eleccion_canal),
+    P7_cambio_canal = as.character(P7_cambio_canal),
+    P9_espera_domicilio = as.character(P9_espera_domicilio), 
+    P8_espera_cc = as.character(P8_espera_cc),
+    
+    perfil_persuasion_detallado = case_when(
+      
+      # Los que ya eran ecológicos sin decirles nada
+      escenario_id %in% c("A", "B") & P5_eleccion_canal == "1" ~ "1. Sostenible a la 1a",
+      escenario_id %in% c("C", "D") & P5_eleccion_canal %in% c("1", "2") ~ "1. Sostenible a la 1a",
+      
+      # Escenarios A y B (Sin C&C - Solo pueden ir a Tienda o esperar)
+      escenario_id %in% c("A", "B") & P5_eleccion_canal == "2" & P7_cambio_canal == "2" ~ "2. Persuadidos a Tienda Física",
+      escenario_id %in% c("A", "B") & P5_eleccion_canal == "2" & P7_cambio_canal == "1" & P9_espera_domicilio == "2" ~ "4. Persuadidos a Esperar (Domicilio 7d)",
+      escenario_id %in% c("A", "B") & P5_eleccion_canal == "2" & P7_cambio_canal == "1" & P9_espera_domicilio == "1" ~ "5. Resistentes Absolutos",
+      
+      # ESCENARIOS C y D (Con C&C - El doble Nudge)
+      # Cambian a Tienda Física (saltan a P10C)
+      escenario_id %in% c("C", "D") & P5_eleccion_canal == "3" & P7_cambio_canal == "2" ~ "2. Persuadidos a Tienda Física",
+      
+      # Cambian a C&C y además aceptan esperar 7 días (P8C = 2)
+      escenario_id %in% c("C", "D") & P5_eleccion_canal == "3" & P7_cambio_canal == "3" & P8_espera_cc == "2" ~ "3. Persuadidos a C&C Lento",
+      
+      # Cambian a C&C pero exigen que esté en 3 días (P8C = 1)
+      escenario_id %in% c("C", "D") & P5_eleccion_canal == "3" & P7_cambio_canal == "3" & P8_espera_cc == "1" ~ "3. Persuadidos a C&C Rápido",
+      
+      # Se quedan en Domicilio, pero aceptan esperar 7 días (P9C = 2)
+      escenario_id %in% c("C", "D") & P5_eleccion_canal == "3" & P7_cambio_canal == "1" & P9_espera_domicilio == "2" ~ "4. Persuadidos a Esperar (Domicilio 7d)",
+      
+      # Domicilio y en 3 días o nada.
+      escenario_id %in% c("C", "D") & P5_eleccion_canal == "3" & P7_cambio_canal == "1" & P9_espera_domicilio == "1" ~ "5. Resistentes Absolutos",
+      
+      TRUE ~ NA_character_
+    )
+  )
+
+print(table(df_analisis$perfil_persuasion_detallado))
+```
+
+
+```{r}
+df_analisis <- df_analisis %>%
+  # Filtramos a los que contestaron "No lo sé" en la población
+  filter(!is.na(S3_poblacion) & S3_poblacion != "No lo sé") %>%
+  mutate(
+    S3_num = as.numeric(S3_poblacion),
+    # 1 = Gran Ciudad (Más de 50.000 habitantes, niveles 5, 6 y 7)
+    # 0 = Ciudad mediana, pequeña o entorno rural
+    Gran_Ciudad = ifelse(S3_num >= 5, 1, 0)
+  )
+
+# Creación target persuasión
+df_analisis <- df_analisis %>%
+  mutate(
+    target_persuasion_real = case_when(
+      # Si son Sostenibles o NA, les ponemos NA en el target para que el modelo los ignore
+      perfil_persuasion_detallado %in% c("1. Sostenible a la 1a", NA) ~ NA_real_, 
+      
+      # Si son Resistentes, un 0
+      perfil_persuasion_detallado == "5. Resistentes Absolutos" ~ 0,
+      
+      # Para todos los demás, un 1
+      TRUE ~ 1
+    )
+  )
+```
+
+
+## Reordenación de la Arquitectura Lógica
+
+```{r}
+df_analisis <- df_analisis %>%
+  select(
+    # Identificadores y Control de Calidad
+    ID_global, REGISTRO, DURACION,
+    
+    # Perfil Sociodemográfico
+    S2_sexo, AGE, CUOTA_EDAD, S3_poblacion, Gran_Ciudad,
+    
+    # Hábitos de Compra Previos
+    P1_habito_compra, P2_habito_info,
+    
+    # Diseño Experimental (Factores de estímulo)
+    escenario_id, factor_precio, factor_cc,
+    
+    # Variables de Control del Experimento
+    P10_manipulation_check, P11_realismo,
+    
+    # VARIABLES OBJETIVO (Target y Propensiones)
+    P5_eleccion_canal, 
+    P7_cambio_canal,
+    perfil_persuasion_detallado,
+    eleccion_sostenible, 
+    eleccion_sostenible_factor,
+    P6_1_intencion_tienda, 
+    P6_2_intencion_cc, 
+    P6_3_intencion_online,
+    P8_espera_cc, 
+    P9_espera_domicilio,
+    
+    # Constructos Psicométricos Analíticos
+    z_conciencia_amb, z_sensib_precio, z_gratificacion, z_mala_conciencia,
+    conciencia_ambiental_media, sensibilidad_precio_media, gratificacion_media, mala_conciencia_media,
+    
+    # Ítems Crudos de Escalas Likert
+    starts_with("P3_"), 
+    starts_with("P4_"), 
+    starts_with("P12_"), 
+    starts_with("P13_"),
+    
+    # Cierre de seguridad por si nos dejamos alguna
+    everything()
+  )
+
+# Exportación de la base de datos limpia
+write_csv(df_analisis, here::here("data", "dataset_tfg_limpio.csv"))
+```
+
+# Depuración y Calidad del Dataset (Data Quality)
+
+## Criterios de Inclusión
+
+```{r}
+
+cat("Registros iniciales en bruto (N):", nrow(df_analisis), "\n")
+
+# Aplicación de filtros P1 y P2
+df_filtrado <- df_analisis %>%
+  filter(!P1_habito_compra %in% c("1", "5", 1, 5)) %>%
+  filter(!P2_habito_info %in% c("1", "5", 1, 5))
+
+cat("\nUsuarios eliminados por no cumplir el perfil de compra (P1/P2):", nrow(df_analisis) - nrow(df_filtrado), "\n")
+```
+## Filtro de Patrones Atípicos
+
+```{r}
+# AUDITORÍA DE TIEMPOS (Speeders y Sleepers) 
+umbral_rapidez <- quantile(df_filtrado$DURACION, 0.05, na.rm = TRUE)
+q3_tiempo <- quantile(df_filtrado$DURACION, 0.75, na.rm = TRUE)
+iqr_tiempo <- IQR(df_filtrado$DURACION, na.rm = TRUE)
+limite_superior_tiempo <- q3_tiempo + 1.5 * iqr_tiempo
+
+cat("\n--- Análisis de Tiempos de Respuesta ---\n")
+summary(df_analisis$DURACION)
+cat("Umbral inferior (Percentil 5 - Speeders):", round(umbral_rapidez, 1), "segundos.\n")
+cat("Umbral superior estadístico (Sleepers):", round(limite_superior_tiempo, 1), "segundos.\n")
+
+# AUDITORÍA DE STRAIGHTLINING (Varianza Cero)
+# Vamos a mirar si alguien contestó lo mismo a todas las preguntas de la P3, P4, P12 y P13,
+df_filtrado <- df_filtrado %>%
+  rowwise() %>%
+  mutate(
+    # Calculamos la desviación típica por fila de todas las escalas Likert
+    varianza_respuestas = sd(c_across(c(starts_with("P3_"), starts_with("P4_"), starts_with("P13_"), starts_with("P12_"))), na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+cat("\n--- Análisis de Straightlining (Patrón de Varianza Cero) ---\n")
+# Contamos cuántos usuarios tienen una desviación típica exacta de 0
+sospechosos_linea_plana <- sum(df_filtrado$varianza_respuestas == 0, na.rm = TRUE)
+print(paste("Usuarios que respondieron exactamente lo mismo a todas las escalas:", sospechosos_linea_plana))
+```
+
+
+```{r}
+# INSPECCIÓN DE LOS 5 STRAIGHTLINERS (VARIANZA CERO)
+
+# Aislamos a los sospechosos para ver qué contestaron
+sospechosos_linea_plana <- df_filtrado %>%
+  filter(varianza_respuestas == 0) %>%
+  select(ID_global, DURACION, P5_eleccion_canal, starts_with("P3_"), starts_with("P4_"), starts_with("P13_"), starts_with("P12_"))
+
+print(sospechosos_linea_plana)
+
+cat("\nTamaño muestral (N) final y definitivo es:", nrow(df_filtrado), "\n")
+```
+
+```{r}
+# INSPECCIÓN DE LOS USUARIOS ULTRARRÁPIDOS (< 155 segundos)
+
+# Filtramos a los usuarios del percentil inferior y seleccionamos columnas clave
+rapidos_inspeccion <- df_analisis %>%
+  filter(DURACION <= 155) %>%
+  arrange(DURACION)
+
+# Mostramos a los sospechosos
+print(rapidos_inspeccion)
+
+
+```
+
+```{r}
+# CRUCE DE MÉTRICAS 
+df_filtrado <- df_filtrado %>%
+  mutate(
+    es_speeder = DURACION < umbral_rapidez,
+    es_sleeper = DURACION > limite_superior_tiempo,
+    es_straightliner = varianza_respuestas == 0,
+    
+    # Condición para eliminar: Si es Straightliner Y Speeder (El peor caso)
+    marcado_para_borrar = es_speeder & es_straightliner
+  )
+
+# Resumen antes de borrar
+cat("\n--- Auditoría de Calidad Cruzada ---\n")
+cat("Speeders totales:", sum(df_filtrado$es_speeder, na.rm = TRUE), "\n")
+cat("Straightliners totales:", sum(df_filtrado$es_straightliner, na.rm = TRUE), "\n")
+cat("Culpables de AMBAS cosas (Para eliminar):", sum(df_filtrado$marcado_para_borrar, na.rm = TRUE), "\n")
+
+```
+
+
+
+## Detección de Valores Atípicos Multivariantes 
+
+```{r}
+# Comprobación de NAs estructurales por rama del experimento
+nas_por_grupo <- df_filtrado %>%
+  group_by(escenario_id) %>%
+  summarise(Porcentaje_NA_Intencion_CC = mean(is.na(P6_2_intencion_cc)) * 100)
+print(nas_por_grupo)
+
+# Aislamiento del dataset operativo
+df_modelo <- df_filtrado %>%
+  filter(!S3_poblacion %in% c("No lo sé")) %>%
+  drop_na(eleccion_sostenible, factor_precio, 
+          z_conciencia_amb, z_sensib_precio, z_gratificacion, z_mala_conciencia) %>%
+  droplevels()
+```
+
+
+```{r}
+# Distancia de Mahalanobis
+
+vars_psico <- df_modelo %>% select(z_conciencia_amb, z_sensib_precio, z_gratificacion, z_mala_conciencia)
+medias_multi <- colMeans(vars_psico)
+matriz_cov <- cov(vars_psico)
+
+df_modelo$mahalanobis_dist <- mahalanobis(vars_psico, center = medias_multi, cov = matriz_cov)
+punto_corte_mahal <- qchisq(0.999, df = ncol(vars_psico))
+
+df_grafico_mahal <- df_modelo %>%
+  arrange(mahalanobis_dist) %>%
+  mutate(
+    Index = row_number(),
+    p_valor_mah = pchisq(mahalanobis_dist, df = 4, lower.tail = FALSE),
+    Es_Outlier = ifelse(mahalanobis_dist > punto_corte_mahal, "Outlier Caótico", "Normal")
+  )
+
+grafico_mahal <- ggplot(df_grafico_mahal, aes(x = Index, y = mahalanobis_dist, color = Es_Outlier)) +
+  geom_point(alpha = 0.7, size = 2.5) +
+  geom_hline(yintercept = punto_corte_mahal, linetype = "dashed", color = "red", linewidth = 1) +
+  labs(
+    title = "Detección de outliers multivariantes mediante distancia de Mahalanobis",
+    subtitle = paste("Umbral basado en distribución χ² (p = 0.001):", round(punto_corte_mahal, 2)),
+    x = "Observaciones ordenadas",
+    y = expression("Distancia de Mahalanobis " * (D^2))
+  ) +
+  scale_color_manual(values = c("Normal" = "#2A9D8F", "Outlier Caótico" = "#E76F51")) +
+  theme_minimal() +
+  theme(legend.position = "bottom", legend.title = element_blank())
+
+grafico_mahal
+
+```
+
+```{r}
+df_grafico_mahal <- df_grafico_mahal %>%
+  filter(Es_Outlier == "Outlier Caótico") %>%
+  select(ID_global, z_conciencia_amb, z_sensib_precio, 
+         z_gratificacion, z_mala_conciencia, mahalanobis_dist, p_valor_mah) %>%
+  mutate(
+    mahalanobis_dist = round(mahalanobis_dist, 2),
+    
+    p_valor_mah = formatC(p_valor_mah, format = "e", digits = 2)
+  )
+
+print("PERFIL DE LOS 3 OUTLIERS RETENIDOS")
+print(df_grafico_mahal)
+```
+
+```{r}
+# Creamos el dataframe asegurando el orden lógico temporal
+df_summary <- tibble(
+  Etapa = factor(
+    c("Muestra Inicial", "Tras eliminar Speeders","Tras limpieza de NAs"),
+    levels = c("Muestra Inicial", "Tras eliminar Speeders","Tras limpieza de NAs") # Mismos nombres y en orden
+  ),
+  Casos = c(nrow(df_analisis), nrow(df_filtrado), nrow(df_modelo)) 
+)
+
+# Generamos el gráfico
+ggplot(df_summary, aes(x = Etapa, y = Casos)) +
+  geom_col(fill = "#2A9D8F", alpha = 0.8, width = 0.5) + 
+  geom_text(aes(label = Casos), vjust = -0.6, size = 5, fontface = "bold") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    x = "Etapa del proceso de depuración",
+    y = "Número de sujetos (N)",
+    title = "Evolución del tamaño de la muestra",
+    subtitle = "Proceso de depuración de la muestra"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "grey40", size = 11),
+    axis.text.x = element_text(size = 12, face = "bold"),
+    panel.grid.major.x = element_blank()
+  )
+
+
+```
+
+
+#  Análisis Exploratorio de Datos (EDA)
+
+## Perfil Sociodemográfico y Geográfico
+
+```{r}
+# ANÁLISIS DESCRIPTIVO SOCIODEMOGRÁFICO
+cat("\n--- 1. DISTRIBUCIÓN POR GÉNERO (S2_sexo) ---\n")
+tabla_genero <- df_modelo %>%
+  count(S2_sexo) %>%
+  mutate(Porcentaje = round(n / sum(n) * 100, 2))
+print(tabla_genero)
+
+cat("\n--- 2. DISTRIBUCIÓN POR TRAMO DE EDAD (CUOTA_EDAD) ---\n")
+tabla_edad <- df_modelo %>%
+  count(CUOTA_EDAD) %>%
+  mutate(Porcentaje = round(n / sum(n) * 100, 2))
+print(tabla_edad)
+
+cat("\n--- 3. DISTRIBUCIÓN POR TAMAÑO DE POBLACIÓN (S3_poblacion) ---\n")
+tabla_pob <- df_modelo %>%
+  count(S3_poblacion) %>%
+  mutate(Porcentaje = round(n / sum(n) * 100, 2))
+print(tabla_pob)
+
+# Perfil Demográfico Cruzado (Edad y Género)
+# Filtramos NAs por si acaso para que el gráfico quede limpio
+grafico_demografico <- ggplot(df_modelo %>% filter(!is.na(S2_sexo), !is.na(CUOTA_EDAD)), 
+                              aes(x = CUOTA_EDAD, fill = S2_sexo)) +
+  
+  # Barras puestas una al lado de la otra (dodge)
+  geom_bar(position = "dodge", color = "white", width = 0.7) +
+  
+  # Colores elegantes
+  scale_fill_manual(values = c("Femenino" = "#E76F51", "Masculino" = "#264653")) +
+  
+  # Títulos y etiquetas formales
+  labs(
+    title = "Perfil Sociodemográfico de la Muestra",
+    subtitle = "Distribución por tramos de edad y género",
+    x = "Tramo de Edad",
+    y = "Número de Participantes (Frecuencia Absoluta)",
+    fill = "Género:"
+  ) +
+  
+  # Tema minimalista 
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "top",
+    axis.text = element_text(size = 11),
+    axis.title = element_text(face = "bold")
+  )
+
+# Mostramos el gráfico
+print(grafico_demografico)
+```
+
+```{r}
+describe(df_modelo$AGE)
+```
+
+
+```{r}
+# 1. Preparar los datos (Cálculo de frecuencias y porcentajes)
+df_resumen_genero <- df_modelo %>%
+  # Quitamos NAs (si los hay) para que no salga una barra de "Desconocido"
+  filter(!is.na(S2_sexo)) %>% 
+  count(S2_sexo) %>%
+  mutate(
+    Porcentaje = round((n / sum(n)) * 100, 1),
+    # Creamos la etiqueta que pondremos encima de la barra: "N \n (X%)"
+    Etiqueta = paste0(n, "\n(", Porcentaje, "%)") 
+  )
+
+# 2. Dibujar el gráfico
+grafico_genero <- ggplot(df_resumen_genero, aes(x = S2_sexo, y = n, fill = S2_sexo)) +
+  
+  # Hacemos las barras con borde blanco y un poco de transparencia
+  geom_col(color = "white", alpha = 0.85, width = 0.6) +
+  
+  # Añadimos las etiquetas con N y % justo encima de cada barra
+  geom_text(aes(label = Etiqueta), 
+            vjust = -0.3, size = 4.5, fontface = "bold", color = "grey20") +
+  
+  # Ajustamos los colores (Femenino / Masculino) para mantener tu estética
+  scale_fill_manual(values = c("Femenino" = "#E76F51", "Masculino" = "#264653")) +
+  
+  # Le damos espacio arriba para que el texto no se corte
+  scale_y_continuous(limits = c(0, max(df_resumen_genero$n) * 1.15)) +
+  
+  labs(
+    title = "Distribución de la Muestra por Género",
+    subtitle = "Frecuencia absoluta y porcentaje sobre el total",
+    x = "Identidad de Género",
+    y = "Número de Participantes (N)"
+  ) +
+  
+  # Diseño limpio y profesional
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold"),
+    axis.text.x = element_text(size = 12, face = "bold"),
+    legend.position = "none",
+    panel.grid.major.x = element_blank()
+  )
+
+# 3. Mostrar el gráfico
+print(grafico_genero)
+
+```
+
+
+```{r}
+# Gráfico: Edad y Género
+grafico_demografico <- ggplot(df_modelo, aes(x = CUOTA_EDAD, fill = S2_sexo)) +
+  geom_bar(position = "dodge", color = "white", width = 0.7) +
+  scale_fill_manual(values = c("Femenino" = "#E76F51", "Masculino" = "#264653")) +
+  labs(
+    title = "Perfil Sociodemográfico de la Muestra",
+    subtitle = "Distribución cruzada por tramos de edad y género",
+    x = "Tramo de Edad",
+    y = "Frecuencia Absoluta",
+    fill = "Género:"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "top",
+    axis.title = element_text(face = "bold")
+  )
+
+print(grafico_demografico)
+
+# Tamaño de Población
+
+# 1. Preparamos los datos
+df_resumen_pob <- df_modelo %>%
+  filter(!is.na(S3_poblacion)) %>%
+  count(S3_poblacion) %>%
+  mutate(
+    pct = n / sum(n), # Lo usamos para la altura de la barra en el eje Y
+    Porcentaje = round(pct * 100, 1),
+    # Creamos la etiqueta doble
+    Etiqueta = paste0(n, "\n(", Porcentaje, "%)") 
+  )
+
+# 2. Dibujamos el gráfico
+grafico_poblacion <- ggplot(df_resumen_pob, aes(x = S3_poblacion, y = pct)) +
+  
+  # Colores y diseño de barras
+  geom_col(fill = "#E9C46A", color = "black", alpha = 0.85, width = 0.7) +
+  
+  # Usamos la etiqueta que creamos
+  geom_text(aes(label = Etiqueta), vjust = -0.3, size = 3.5, fontface = "bold", color = "grey20") +
+  
+  # Límite dinámico mucho más sencillo y limpio
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1), 
+    limits = c(0, max(df_resumen_pob$pct) * 1.15) # Da un 15% de margen arriba
+  ) +
+  labs(
+  title = "Distribución de la muestra según el tamaño del municipio",
+  subtitle = "Frecuencia absoluta y porcentaje de cada categoría",
+  x = "Tamaño del municipio (habitantes)",
+  y = "Porcentaje"
+  )+
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold"),
+    
+    axis.text.x = element_text(face = "bold", size = 10, angle = 0),
+    
+    panel.grid.major.x = element_blank()
+  )
+
+# 3. Mostrar el gráfico
+print(grafico_poblacion)
+
+
+```
+
+```{r}
+# PREPARAMOS LOS DATOS DEL GRÁFICO
+df_resumen_demo <- df_modelo %>%
+  filter(!is.na(S2_sexo), !is.na(CUOTA_EDAD)) %>%
+  count(CUOTA_EDAD, S2_sexo) %>%
+  mutate(
+    Porcentaje = round((n / sum(n)) * 100, 1), # % sobre el total de la muestra
+    Etiqueta = paste0(n, "\n(", Porcentaje, "%)")
+  )
+
+# DIBUJAMOS EL GRÁFICO
+grafico_demografico <- ggplot(df_resumen_demo, aes(x = CUOTA_EDAD, y = n, fill = S2_sexo)) +
+  
+  # Usamos geom_col en lugar de geom_bar porque ya tenemos la columna 'n'
+  geom_col(position = position_dodge(width = 0.8), color = "white", width = 0.7) +
+  
+  # Añadimos el texto (Número y %)
+  geom_text(aes(label = Etiqueta), 
+            position = position_dodge(width = 0.8), 
+            vjust = -0.2, # Sube el texto un poco por encima de la barra
+            size = 3.5, fontface = "bold", color = "grey20") +
+  
+  # Aumentamos el límite superior de la Y para que quepa el texto de las barras más altas
+  scale_y_continuous(limits = c(0, max(df_resumen_demo$n) * 1.2)) +
+  
+  scale_fill_manual(values = c("Femenino" = "#E76F51", "Masculino" = "#264653")) +
+  labs(
+    title = "Perfil Sociodemográfico de la Muestra",
+    subtitle = "Distribución cruzada por tramos de edad y género (Frecuencia y % total)",
+    x = "Tramo de Edad",
+    y = "Número de Participantes",
+    fill = "Género:"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "top",
+    axis.text = element_text(size = 11),
+    axis.title = element_text(face = "bold")
+  )
+
+print(grafico_demografico)
+```
+
+
+```{r}
+grafico_histograma <- ggplot(df_modelo %>% filter(!is.na(AGE)), aes(x = AGE)) +
+  geom_histogram(binwidth = 2, fill = "#2A9D8F", color = "white", alpha = 0.8) +
+  
+  
+  labs(
+    title = "Distribución de la edad",
+    subtitle = "Frecuencia de participantes por edad",
+    x = "Edad (Años)",
+    y = "Frecuencia (N)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold")
+  ) 
+
+print(grafico_histograma)
+
+
+```
+
+```{r}
+grafico_boxplot <- ggplot(df_modelo %>% filter(!is.na(AGE), !is.na(S2_sexo)), 
+                          aes(x = S2_sexo, y = AGE, fill = S2_sexo)) +
+  
+  geom_boxplot(color = "black", alpha = 0.8, width = 0.5) +
+  
+  scale_fill_manual(values = c("Femenino" = "#E76F51", "Masculino" = "#264653")) +
+  
+  labs(
+    title = "Dispersión de la Edad por Género",
+    subtitle = "Mediana, cuartiles y valores atípicos",
+    x = "Género",
+    y = "Edad (Años)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold"),
+    axis.text.x = element_text(size = 12, face = "bold"),
+    legend.position = "none" # Quitamos la leyenda porque el eje X ya lo deja claro
+  )
+
+print(grafico_boxplot)
+```
+```{r}
+# 1. PREPARAMOS LOS DATOS 
+df_resumen_edad <- df_modelo %>%
+  filter(!is.na(CUOTA_EDAD)) %>%
+  count(CUOTA_EDAD) %>%
+  mutate(
+    Porcentaje = round((n / sum(n)) * 100, 1),
+    Etiqueta = paste0(n, "\n(", Porcentaje, "%)")
+  )
+
+# 2. DIBUJAMOS EL GRÁFICO
+grafico_tramos_edad <- ggplot(df_resumen_edad, aes(x = CUOTA_EDAD, y = Porcentaje)) +
+  
+  geom_col(fill = "#2A9D8F", color = "white", width = 0.6) +
+  
+  # Añadimos el texto (Número y %) encima de la barra
+  geom_text(aes(label = Etiqueta), 
+            vjust = -0.2, size = 4, fontface = "bold", color = "grey20") +
+  
+  # Aumentamos el límite superior de la Y un 15% para que no se corte el texto
+  scale_y_continuous(limits = c(0, max(df_resumen_edad$Porcentaje) * 1.15)) +
+  
+  labs(
+    title = "Distribución por tramos de edad",
+    subtitle = "Frecuencia absoluta y porcentaje sobre el total de la muestra",
+    x = "Tramo de edad",
+    y = "Número de participantes"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(size = 11, face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.major.x = element_blank() # Quita líneas verticales de fondo
+  ) 
+
+print(grafico_tramos_edad)
+
+```
+
+```{r}
+grafico_boxplot_edad <- ggplot(df_modelo %>% filter(!is.na(AGE)), aes(x = "", y = AGE)) +
+  
+  # El boxplot para el total de la muestra
+  geom_boxplot(fill = "#2A9D8F", color = "black", alpha = 0.8, width = 0.3) +
+  
+  labs(
+  title = "Distribución de la edad",
+  subtitle = "Representación mediante diagrama de caja y bigotes",
+  x = NULL,
+  y = "Edad (años)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title.y = element_text(face = "bold"),
+    axis.text.x = element_blank(), # Esconde el texto del eje X
+    axis.ticks.x = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+print(grafico_boxplot_edad)
+
+```
+
+## Balanceo del Diseño Experimental 
+
+```{r}
+# Gráfico: Balance de Escenarios
+grafico_escenarios <- df_modelo %>%
+  count(escenario_id) %>%
+  mutate(pct = n / sum(n)) %>%
+  ggplot(aes(x = escenario_id, y = pct, fill = escenario_id)) +
+  geom_col(color = "black", alpha = 0.8, width = 0.6) +
+  geom_text(aes(label = percent(pct, accuracy = 0.1)), vjust = -1, fontface = "bold") +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 0.4)) +
+  scale_fill_brewer(palette = "Blues") +
+  labs(
+    title = "Balanceo de la Asignación Experimental",
+    subtitle = "Distribución por escenario (Línea roja = 25% ideal)",
+    x = "Escenario Experimental",
+    y = "Porcentaje de la Muestra"
+  ) +
+  theme_minimal() + theme(legend.position = "none", plot.title = element_text(face = "bold"))
+
+print(grafico_escenarios)
+
+# Gráfico: Tasa de Elección Sostenible por Escenario
+grafico_target <- df_modelo %>%
+  group_by(escenario_id, eleccion_sostenible_factor) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  group_by(escenario_id) %>%
+  mutate(pct = n / sum(n)) %>%
+  filter(eleccion_sostenible_factor == "Física/C&C (Sost.)") %>%
+  ggplot(aes(x = escenario_id, y = pct, fill = escenario_id)) +
+  geom_col(color = "black", alpha = 0.85, width = 0.6) +
+  geom_text(aes(label = paste0(n, "\n(", scales::percent(pct, accuracy = 0.1), ")")),
+          vjust = -0.5,
+          fontface = "bold") +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  scale_fill_brewer(palette = "Greens") +
+  labs(
+    title = "Elección sostenible según escenario experimental",
+    subtitle = "Porcentaje de participantes que seleccionaron un canal sostenible",
+    x = "Escenario experimental",
+    y = "Porcentaje de elección sostenible"
+  ) +
+  theme_minimal() + theme(legend.position = "none", plot.title = element_text(face = "bold"))
+
+print(grafico_target)
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# 1) Homogeneizamos las respuestas numéricas según el escenario antes de agrupar
+df <- df_modelo %>%
+  filter(!is.na(escenario_id)) %>% # Aseguramos que el escenario esté registrado
+  mutate(
+    # Creamos una única variable de texto basada en la codificación por escenario
+    canal_elegido_homogeneo = case_when(
+      escenario_id %in% c("A", "B") & P5_eleccion_canal == 1 ~ "Tienda",
+      escenario_id %in% c("A", "B") & P5_eleccion_canal == 2 ~ "Online",
+      
+      escenario_id %in% c("C", "D") & P5_eleccion_canal == 1 ~ "Tienda",
+      escenario_id %in% c("C", "D") & P5_eleccion_canal == 2 ~ "Click&Collect",
+      escenario_id %in% c("C", "D") & P5_eleccion_canal == 3 ~ "Online",
+      
+      TRUE ~ NA_character_ # Por si hay algún valor perdido o fuera de rango
+    )
+  ) %>%
+  filter(!is.na(canal_elegido_homogeneo)) # Eliminamos filas sin respuesta válida
+
+# 2) Frecuencias y porcentajes
+df_grafico_inicial <- df %>%
+  count(escenario_id, canal_elegido_homogeneo) %>%
+  group_by(escenario_id) %>%
+  mutate(
+    pct = n / sum(n) * 100,
+    escenario_label = factor(escenario_id, levels = c("A", "B", "C", "D")),
+    canal_val = factor(
+      canal_elegido_homogeneo,
+      levels = c("Online", "Tienda", "Click&Collect"),
+    )
+  ) %>%
+  ungroup()
+
+# 3) Gráfico
+plot_fase1 <- ggplot(df_grafico_inicial,
+                      aes(x = escenario_label, y = pct, fill = canal_val)) +
+  geom_col(position = "stack", color = "white", width = 0.65) +
+  geom_text(
+    aes(label = paste0(round(pct, 1), "%\n(n = ", n, ")")),
+    position = position_stack(vjust = 0.5),
+    size = 3.5,
+    fontface = "bold"
+  ) +
+  scale_y_continuous(labels = label_percent(scale = 1), expand = c(0, 0)) +
+  scale_fill_manual(values = c(
+    "Online" = "#E63946",
+    "Tienda" = "#2A9D8F",
+    "Click&Collect" = "#E9C46A"
+  )) +
+  labs(
+    title = "Distribución de la decisión de compra inicial por escenario",
+    x = "Escenario experimental",
+    y = "Porcentaje de participantes",
+    fill = "Opción de compra"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    legend.position = "bottom",
+    panel.grid.major.x = element_blank()
+  )
+
+print(plot_fase1)
+
+
+```
+
+
+
+
+## Perfilado Psicométrico 
+
+```{r}
+# 1. Definimos las etiquetas de la escala (1 a 7)
+niveles <- c(
+  "Totalmente en desacuerdo",
+  "Muy en desacuerdo",
+  "En desacuerdo",
+  "Ni de acuerdo ni en desacuerdo",
+  "De acuerdo",
+  "Muy de acuerdo",
+  "Totalmente de acuerdo"
+)
+
+# 2. Seleccionamos las columnas agrupadas por coherencia de constructo
+df_likert <- df_modelo %>%
+  select(
+    starts_with("P13_"), # Preocupación Ambiental
+    starts_with("P4_"),  # Sensibilidad al Precio
+    starts_with("P3_"),  # Gratificación Inmediata
+    starts_with("P12_")  # Mala Conciencia por Showrooming
+  )
+
+# 3. Creamos un vector limpio con las frases reformuladas 
+etiquetas_limpias <- c(
+  "P13.1: Me preocupa el medioambiente",
+  "P13.2: Estoy dispuesto a hacer sacrificios para protegerlo",
+  "P13.3: Me siento implicado en temas de protección",
+  "P4.1: Es importante obtener el mejor precio",
+  "P4.2: Me intereso por conseguir los precios más bajos",
+  "P4.3: Comparo varias tiendas para conseguir el precio más bajo",
+  "P4.4: Vale la pena el tiempo invertido en buscar el mejor precio",
+  "P3.1: Quiero disfrutar del producto inmediatamente",
+  "P3.2: Me cuesta esperar por un producto comprado online",
+  "P3.3: Compraría en tienda física por tener el producto ya",
+  "P12.1: No es responsable comprar online tras mirar en la tienda",
+  "P12.2: No es correcto aprovecharse del servicio de la tienda física",
+  "P12.3: Tengo mala conciencia al hacer showrooming"
+)
+
+# Asignamos nombres técnicos provisionales 
+names(df_likert) <- paste0("Item_", 1:13)
+
+# 4. Convertimos todo a factores ordenados
+df_likert_fact <- as.data.frame(lapply(df_likert, function(x) {
+  factor(x, levels = 1:7, labels = niveles, ordered = TRUE)
+}))
+
+# 5. Generamos el objeto likert
+grafico_likert <- likert(df_likert_fact)
+
+# 6. Dibujamos el gráfico forzando las etiquetas literales con espacios
+plot_psico <- plot(grafico_likert, 
+                   ordered = FALSE, 
+                   group.order = names(df_likert_fact)) + 
+  ggtitle("Distribución de respuestas en las escalas psicográficas") +
+  scale_x_discrete(labels = rev(etiquetas_limpias)) + 
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 12, margin = margin(b=10)),
+    axis.text.y = element_text(size = 9, face = "plain", color = "black"), 
+    legend.position = "bottom",
+    legend.text = element_text(size = 8),
+    panel.grid.major.y = element_blank() 
+  )
+
+print(plot_psico)
+
+
+```
+
+
+```{r}
+diccionario <- tibble(
+  Constructo = c("conciencia_ambiental_media",
+                 "sensibilidad_precio_media",
+                 "gratificacion_media",
+                 "mala_conciencia_media"),
+  
+  Constructo_label = c("Conciencia ambiental",
+                       "Sensibilidad al precio",
+                       "Gratificación inmediata",
+                       "Mala conciencia")
+)
+
+df_boxplots <- df_modelo %>%
+  select(conciencia_ambiental_media, sensibilidad_precio_media, 
+         gratificacion_media, mala_conciencia_media) %>%
+  
+  pivot_longer(
+    everything(),
+    names_to = "Constructo",
+    values_to = "Puntuacion"
+  ) %>%
+  
+  left_join(diccionario, by = "Constructo")
+
+grafico_boxplots <- ggplot(df_boxplots, aes(x = Constructo_label, y = Puntuacion, fill = Constructo_label)) +
+  geom_boxplot(alpha = 0.6, outlier.colour = "red", outlier.shape = 4, outlier.size = 3) +
+  geom_jitter(width = 0.15, alpha = 0.2, color = "black") +
+  scale_y_continuous(breaks = 1:7, limits = c(1, 7)) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+  title = "Distribución de los constructos psicográficos",
+  subtitle = "Puntuaciones observadas en las escalas utilizadas en el estudio",
+  x = "Constructos psicográficos",
+  y = "Puntuación media"
+) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(face = "bold", size = 11, angle = 0),
+    legend.position = "none"
+  )
+
+print(grafico_boxplots)
+
+```
+
+
+## Validación del Diseño Experimental y Auditoría Psicométrica
+
+## Chequeos de Manipulación 
+
+```{r}
+cat("\n--- Control de Realismo (Validez Externa) ---\n")
+resumen_realismo <- df_modelo %>%
+  summarise(
+    Media_Realismo = round(mean(P11_realismo, na.rm = TRUE), 2),
+    SD_Realismo = round(sd(P11_realismo, na.rm = TRUE), 2)
+  )
+print(resumen_realismo)
+
+cat("\n--- Manipulation Check: Percepción de Precio ---\n")
+resumen_manipulacion <- df_modelo %>%
+  group_by(escenario_id) %>%
+  summarise(
+    Media_Precio = round(mean(P10_manipulation_check, na.rm = TRUE), 2)
+  )
+print(resumen_manipulacion)
+```
+
+
+```{r}
+# CHEQUEO DE REALISMO
+
+# 1. ANOVA Unifactorial para ver si hay diferencias de realismo
+anova_realismo <- aov(P11_realismo ~ escenario_id, data = df_modelo)
+cat("\n--- RESULTADOS ANOVA: REALISMO ---\n")
+summary(anova_realismo)
+
+# 2. Prueba de Levene (Homogeneidad de varianzas)
+cat("\n--- PRUEBA DE LEVENE ---\n")
+leveneTest(P11_realismo ~ escenario_id, data = df_modelo)
+
+# 3. Comparaciones Post-Hoc de Tukey (por pares)
+cat("\n--- PRUEBA DE TUKEY ---\n")
+TukeyHSD(anova_realismo)
+
+```
+
+
+```{r}
+# ANOVA de Manipulación de Precio
+aov_precio <- aov(P10_manipulation_check ~ escenario_id, data = df_modelo)
+summary(aov_precio)
+
+# Contrastes Post-Hoc (Tukey)
+emmeans(aov_precio, "escenario_id") %>%
+  contrast(method = "pairwise", adjust = "tukey")
+```
+
+## Fiabilidad de las Escalas
+
+```{r}
+cat("\nAlfa Ambiental:", round(psych::alpha(df_modelo %>% select(starts_with("P13_")))$total$raw_alpha, 2))
+cat("\nAlfa Precio:", round(psych::alpha(df_modelo %>% select(starts_with("P4_")))$total$raw_alpha, 2))
+cat("\nAlfa Gratificación:", round(psych::alpha(df_modelo %>% select(starts_with("P3_")))$total$raw_alpha, 2))
+cat("\nAlfa Culpa:", round(psych::alpha(df_modelo %>% select(starts_with("P12_")))$total$raw_alpha, 2), "\n")
+```
+
+## Análisis Factorial Confirmatorio 
+
+```{r}
+modelo_cfa <- '
+  ConcienciaAmb =~ P13_1_conciencia_ambiental_1 + P13_2_conciencia_ambiental_2 + P13_3_conciencia_ambiental_3
+  SensibPrecio  =~ P4_1_sensib_precio_1 + P4_2_sensib_precio_2 + P4_3_sensib_precio_3 + P4_4_sensib_precio_4
+  Gratificacion =~ P3_1_grat_inmed_1 + P3_2_grat_inmed_2 + P3_3_grat_inmed_3
+  MalaConscienc =~ P12_1_showrooming_1 + P12_2_showrooming_2 + P12_3_showrooming_3 
+'
+
+fit_cfa <- cfa(model = modelo_cfa, data = df_modelo, std.lv = TRUE, estimator = "MLM")
+
+cat("\n--- Índices de Ajuste ---\n")
+fitmeasures(fit_cfa, c("cfi.robust", "tli.robust", "rmsea.robust", "srmr"))
+
+cat("\n--- Validez Discriminante (HTMT) ---\n")
+htmt(modelo_cfa, df_modelo)
+
+# 3. Solicitamos la salida completa estandarizada
+summary(fit_cfa, standardized = TRUE, fit.measures = TRUE)
+
+# 1. Calculamos el Alfa de Cronbach y el Omega de McDonald de forma directa
+fiabilidad_constructos <- compRelSEM(fit_cfa)
+print(fiabilidad_constructos)
+
+# 2. Calculamos la Varianza Extraída Promedio (AVE) de forma directa
+ave_constructos <- AVE(fit_cfa)
+print(ave_constructos)
+```
+```{r}
+lavInspect(fit_cfa, "cov.lv")
+```
+
+```{r}
+
+cat("--- ALFA DE CRONBACH DE LOS 4 CONSTRUCTOS REALES ---\n")
+
+# 1. Alfa de Conciencia Ambiental
+cat("\nConciencia Ambiental:\n")
+psych::alpha(df_modelo[, c("P13_1_conciencia_ambiental_1", "P13_2_conciencia_ambiental_2", "P13_3_conciencia_ambiental_3")])$total$raw_alpha
+
+# 2. Alfa de Sensibilidad al Precio
+cat("\nSensibilidad al Precio:\n")
+psych::alpha(df_modelo[, c("P4_1_sensib_precio_1", "P4_2_sensib_precio_2", "P4_3_sensib_precio_3", "P4_4_sensib_precio_4")])$total$raw_alpha
+
+# 3. Alfa de Gratificación Inmediata
+cat("\nGratificación Inmediata:\n")
+psych::alpha(df_modelo[, c("P3_1_grat_inmed_1", "P3_2_grat_inmed_2", "P3_3_grat_inmed_3")])$total$raw_alpha
+
+# 4. Alfa de Mala Conciencia
+cat("\nMala Conciencia:\n")
+psych::alpha(df_modelo[, c("P12_1_showrooming_1", "P12_2_showrooming_2", "P12_3_showrooming_3")])$total$raw_alpha
+```
+```{r}
+# 1. Filtramos la base de datos seleccionando solo las 4 variables psicológicas estandarizadas
+variables_psicologicas <- df_modelo[, c("z_conciencia_amb", "z_sensib_precio", "z_gratificacion", "z_mala_conciencia")]
+
+# 2. Ejecutamos la función mágica que calcula todos los descriptivos formales
+reporte_descriptivos <- describe(variables_psicologicas)
+
+# 3. Imprimimos la tabla limpia en la consola
+print(reporte_descriptivos)
+```
+
+
+
+
+# Análisis Bivariado: Explorando la Decisión Inicial
+
+## Matriz de Correlaciones Psicológicas
+
+
+```{r}
+# Extrae la matriz de correlaciones latentes del modelo CFA
+lavInspect(fit_cfa, "cor.lv")
+```
+```{r}
+# Guardamos la matriz de correlaciones
+matriz_cor <- lavInspect(fit_cfa, "cor.lv")
+
+# Dibujamos el mapa de calor
+corrplot(matriz_cor, 
+         method = "color", type = "lower", addCoef.col = "black", 
+         tl.col = "black", tl.srt = 0, diag = FALSE, 
+         col = colorRampPalette(c("#E63946", "white", "#457B9D"))(200), 
+         title = "Matriz de Correlación: Perfil Psicológico", mar = c(0,0,2,0))
+```
+
+
+
+```{r}
+df_corr <- df_modelo %>%
+  select(Conciencia_ambiental = conciencia_ambiental_media, Sensibilidad_Precio = sensibilidad_precio_media, 
+         Gratificación = gratificacion_media, Mala_conciencia = mala_conciencia_media)
+
+corrplot(cor(df_corr, use = "complete.obs"), 
+         method = "color", type = "lower", addCoef.col = "black", 
+         tl.col = "black", tl.srt = 0, diag = FALSE, 
+         col = colorRampPalette(c("#E63946", "white", "#457B9D"))(200), 
+         title = "Matriz de Correlación: Perfil Psicológico", mar = c(0,0,2,0))
+```
+
+```{r}
+colnames(df_corr) <- c(
+  "Conciencia ambiental",
+  "Sensibilidad precio",
+  "Gratificación inmediata",
+  "Mala Conciencia"
+)
+```
+
+
+```{r}
+
+# Matriz de correlaciones
+cor_mat <- cor(df_corr, use = "pairwise.complete.obs")
+
+# Mantener solo triángulo inferior
+cor_mat[upper.tri(cor_mat)] <- NA
+
+# Convertir a formato largo
+corr_long <- melt(
+  cor_mat,
+  na.rm = TRUE,
+  varnames = c("Variable1", "Variable2"),
+  value.name = "r"
+)
+
+
+# Mapa de calor
+ggplot(corr_long, aes(x = Variable1, y = Variable2, fill = r)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.3f", r)), size = 4) +
+  scale_fill_distiller(
+    palette = "RdBu",
+    direction = -1,
+    limits = c(-1, 1),
+    name = "r"
+  ) +
+  coord_equal() +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.title = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "Mapa de calor de correlaciones",
+    subtitle = "Constructos psicográficos"
+  )
+
+```
+```{r}
+# Definimos las variables continuas que vamos a cruzar
+vars_psico <- c("z_conciencia_amb", "z_sensib_precio", "z_gratificacion", "z_mala_conciencia")
+
+# Definimos las variables del modelo completo (psicológicas + target)
+vars_modelo <- c(vars_psico, "eleccion_sostenible") 
+
+
+grafico <- ggpairs(
+  df_modelo,
+  columns = vars_psico,
+  upper = list(continuous = wrap("cor", size = 3)),
+  lower = list(continuous = "smooth"),
+  diag  = list(continuous = "densityDiag")
+) +
+  ggtitle("Matriz de dispersión de variables psicográficas")
+
+print(grafico)
+
+```
+
+```{r}
+grafico_sexo <- ggpairs(
+  df_modelo,
+  columns = vars_psico,
+  mapping = aes(color = S2_sexo, alpha = 0.4),     
+  upper   = list(continuous = wrap("cor", size = 3)),
+  lower   = list(continuous = "smooth"),
+  diag    = list(continuous = "densityDiag")
+) +
+  scale_color_manual(values = c("Femenino" = "#E76F51", "Masculino" = "#264653")) +
+  scale_fill_manual(values = c("Femenino" = "#E76F51", "Masculino" = "#264653")) +
+  ggtitle("Matriz de dispersión de variables psicográficas por sexo")
+
+print(grafico_sexo)
+
+```
+
+```{r}
+cat("\n--- 4. Dispersión coloreada por EDAD ---\n")
+grafico_edad <- ggpairs(
+  df_modelo,
+  columns = vars_psico,
+  mapping = aes(color = CUOTA_EDAD, alpha = 0.4),     
+  upper   = list(continuous = wrap("cor", size = 3)),
+  lower   = list(continuous = "smooth"),
+  diag    = list(continuous = "densityDiag")
+) +
+  ggtitle("Matriz de dispersión de variables psicográficas por edad")
+
+print(grafico_edad)
+
+```
+```{r}
+grafico_gran_ciudad <- ggpairs(
+  df_modelo,
+  columns = vars_psico,
+  mapping = aes(color = as.factor(Gran_Ciudad), alpha = 0.4),     
+  upper   = list(continuous = wrap("cor", size = 3.5, fontface = "bold")),
+  lower   = list(continuous = "smooth"),
+  diag    = list(continuous = "densityDiag")
+) +
+  scale_color_manual(values = c("1" = "#2A9D8F", "0" = "#E76F51"), labels = c("1" = "Gran Ciudad", "0" = "Municipio Menor")) +
+  scale_fill_manual(values = c("1" = "#2A9D8F", "0" = "#E76F51"), labels = c("1" = "Gran Ciudad", "0" = "Municipio Menor")) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold", size = 9),
+    plot.title = element_text(face = "bold", size = 13),
+    legend.title = element_blank() 
+  ) +
+  labs(
+    title ="Matriz de dispersión de variables psicográficas por tamaño de municipio",
+    subtitle = "Gran Ciudad (1) vs. Mediana/Pequeña (0)"
+  )
+
+# Imprimimos el gráfico libre de errores
+print(grafico_gran_ciudad)
+
+```
+
+
+## Cruces Sociodemográficos vs. Comportamiento
+
+
+```{r}
+cat("\nGRÁFICO MEKKO: EDAD VS ELECCIÓN SOSTENIBLE ---\n")
+# 1) Calculamos N y peso de cada grupo de edad
+peso_edad <- df_modelo %>%
+  filter(!is.na(CUOTA_EDAD), !is.na(eleccion_sostenible_factor)) %>%
+  count(CUOTA_EDAD) %>%
+  rename(N_edad = n) %>%
+  mutate(w_edad = N_edad / sum(N_edad))
+
+# 2) Calculamos % de compra verde dentro de cada grupo
+pct_edad <- df_modelo %>%
+  filter(!is.na(CUOTA_EDAD), !is.na(eleccion_sostenible_factor)) %>%
+  count(CUOTA_EDAD, eleccion_sostenible_factor) %>%
+  group_by(CUOTA_EDAD) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup() %>%
+  left_join(peso_edad, by = "CUOTA_EDAD")
+
+# 3) Graficamos con anchura proporcional
+plot_mekko_edad <- ggplot(pct_edad, aes(x = CUOTA_EDAD, y = pct, fill = eleccion_sostenible_factor, width = w_edad)) +
+  geom_col(position = "stack", color = "white", alpha = 0.9) +
+  geom_text(aes(label = sprintf("%1.0f%%\n(n = %d)", pct, n)),
+            position = position_stack(vjust = 0.5), size = 3.5, fontface = "bold", color = "black") +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = c("Domicilio (No Sost.)" = "#E63946", "Física/C&C (Sost.)" = "#3CB371")) +
+  labs(
+  title = "Elección sostenible según tramo de edad",
+  subtitle = "La anchura de cada barra es proporcional al tamaño muestral",
+  x = "Tramo de edad",
+  y = "Porcentaje de elección",
+  fill = "Canal elegido"
+  )+
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
+
+print(plot_mekko_edad)
+
+cat("\nGRÁFICO MEKKO: GÉNERO VS ELECCIÓN SOSTENIBLE ---\n")
+peso_gen <- df_modelo %>%
+  filter(!is.na(S2_sexo), !is.na(eleccion_sostenible_factor)) %>%
+  count(S2_sexo) %>% rename(N_gen = n) %>% mutate(w_gen = N_gen / sum(N_gen))
+
+pct_gen <- df_modelo %>%
+  filter(!is.na(S2_sexo), !is.na(eleccion_sostenible_factor)) %>%
+  count(S2_sexo, eleccion_sostenible_factor) %>%
+  group_by(S2_sexo) %>% mutate(pct = n / sum(n) * 100) %>% ungroup() %>%
+  left_join(peso_gen, by = "S2_sexo")
+
+plot_mekko_gen <- ggplot(pct_gen, aes(x = S2_sexo, y = pct, fill = eleccion_sostenible_factor, width = w_gen)) +
+  geom_col(position = "stack", color = "white", alpha = 0.9) +
+  geom_text(aes(label = sprintf("%1.0f%%\n(n = %d)", pct, n)),
+            position = position_stack(vjust = 0.5), size = 3.5, fontface = "bold", color = "black") +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = c("Domicilio (No Sost.)" = "#E63946", "Física/C&C (Sost.)" = "#3CB371")) +
+  labs(
+    x     = "Sexo",
+    y     = "Porcentaje de elección",
+    fill  = "Canal elegido:",
+    title = "Elección sostenible según sexo",
+    subtitle = "La anchura de cada barra es proporcional al tamaño muestral",
+   ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
+
+print(plot_mekko_gen)
+
+```
+
+```{r}
+cat("\nGRÁFICO MEKKO DOBLE: EDAD x GÉNERO ---\n")
+# 1) Peso de cada combinación
+peso_ge <- df_modelo %>%
+  filter(!is.na(S2_sexo), !is.na(CUOTA_EDAD), !is.na(eleccion_sostenible_factor)) %>%
+  count(S2_sexo, CUOTA_EDAD) %>%
+  rename(N_ge = n) %>%
+  mutate(w_ge = N_ge / sum(N_ge))
+
+# 2) % dentro de cada celda
+pct_ge <- df_modelo %>%
+  filter(!is.na(S2_sexo), !is.na(CUOTA_EDAD), !is.na(eleccion_sostenible_factor)) %>%
+  count(S2_sexo, CUOTA_EDAD, eleccion_sostenible_factor) %>%
+  group_by(S2_sexo, CUOTA_EDAD) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup() %>%
+  left_join(peso_ge, by = c("S2_sexo", "CUOTA_EDAD"))
+
+# 3) Gráfico
+plot_mekko_doble <- ggplot(pct_ge, aes(x = interaction(CUOTA_EDAD, S2_sexo, sep = "\n"), 
+                   y = pct, fill = eleccion_sostenible_factor, width = w_ge)) +
+  geom_col(position = "stack", color = "white", alpha = 0.9) +
+  geom_text(aes(label = sprintf("%1.0f%%\n(n = %d)", pct, n)),
+            position = position_stack(vjust = 0.5), size = 3, fontface = "bold", color = "black") +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = c("Domicilio (No Sost.)" = "#E63946", "Física/C&C (Sost.)" = "#3CB371")) +
+  labs(
+    x     = "Grupo de edad y sexo",
+    y = "Porcentaje de elección",
+    fill = "Canal elegido",
+    title = "Elección sostenible según sexo y edad",
+    subtitle = "La anchura de cada barra es proporcional a la anchura muestral",
+  )  +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"), legend.position = "bottom",
+        axis.text.x = element_text(hjust = 0.5))
+
+print(plot_mekko_doble)
+
+
+# 1) Calculamos el peso de cada combinación triple con la nueva variable
+peso_tripleta <- df_modelo %>%
+  filter(!is.na(S2_sexo), !is.na(CUOTA_EDAD), !is.na(Gran_Ciudad), !is.na(eleccion_sostenible_factor)) %>%
+  count(S2_sexo, CUOTA_EDAD, Gran_Ciudad) %>%
+  rename(N_trip = n) %>%
+  mutate(w_trip = N_trip / sum(N_trip))
+
+# 2) Calculamos los porcentajes de elección dentro de cada nicho
+pct_tripleta <- df_modelo %>%
+  filter(!is.na(S2_sexo), !is.na(CUOTA_EDAD), !is.na(Gran_Ciudad), !is.na(eleccion_sostenible_factor)) %>%
+  count(S2_sexo, CUOTA_EDAD, Gran_Ciudad, eleccion_sostenible_factor) %>%
+  group_by(S2_sexo, CUOTA_EDAD, Gran_Ciudad) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup() %>%
+  # Unimos los pesos para que el ancho de las columnas sea proporcional al tamaño real del nicho
+  left_join(peso_tripleta, by = c("S2_sexo", "CUOTA_EDAD", "Gran_Ciudad")) %>%
+  # Recodificamos los niveles de Gran_Ciudad para que el gráfico quede perfectamente etiquetado
+  mutate(Gran_Ciudad_Label = factor(Gran_Ciudad, 
+                                    levels = c(0, 1), 
+                                    labels = c("Ciutad Mediana/Pequeña", "Gran Ciudad")))
+
+
+# 3) Generamos el Gráfico Facetado Limpio
+plot_mekko_triple <- ggplot(pct_tripleta,
+       aes(x = Gran_Ciudad_Label, y = pct, fill = eleccion_sostenible_factor, width = w_trip)) +
+  geom_col(position = "stack", color = "white", alpha = 0.9) +
+  # Etiquetas de porcentaje e individuales dentro de las barras
+  geom_text(aes(label = sprintf("%1.0f%%\n(n = %d)", pct, n)),
+            position = position_stack(vjust = 0.5), size = 2.5, fontface = "bold", color = "black") +
+   facet_grid(rows = vars(S2_sexo), cols = vars(CUOTA_EDAD), 
+             scales = "free_x", space = "free_x", switch = "y") +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = c("Domicilio (No Sost.)" = "#E63946", "Física/C&C (Sost.)" = "#3CB371")) +
+  labs(
+    x     = "Tramo de edad y tamaño del municipio",
+    y = "Porcentaje de elección",
+    fill = "Canal elegido",
+    title = "Elección sostenible según sexo y edad",
+    subtitle = "La anchura de cada barra es proporcional a la anchura muestral",
+  )  +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 13, margin = margin(b=5)),
+    plot.subtitle = element_text(size = 9, color = "gray30", margin = margin(b=10)),
+    legend.position = "bottom",
+    axis.text.x        = element_text(angle = 0, hjust = 0.5, size = 8.5, face = "plain", color = "black"),
+    strip.placement    = "outside",
+    strip.background   = element_blank(),
+    strip.text.x       = element_text(face = "bold", size = 10, color = "black"),
+    strip.text.y.left  = element_text(face = "bold", angle = 0, size = 10, color = "black"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor  = element_blank(),
+    panel.spacing      = unit(1, "lines") 
+  )
+
+print(plot_mekko_triple)
+
+```
+
+
+```{r}
+cat("\nGRÁFICO MEKKO: GRAN CIUDAD VS ELECCIÓNn")
+
+# 1) Calculamos el N y el peso proporcional de cada categoría de la variable dicotómica
+peso_pob <- df_modelo %>%
+  filter(!is.na(Gran_Ciudad), !is.na(eleccion_sostenible_factor)) %>%
+  count(Gran_Ciudad) %>%
+  rename(N_pob = n) %>%
+  mutate(w_pob = N_pob / sum(N_pob))
+
+# 2) Calculamos los porcentajes de elección dentro de cada tipo de entorno
+pct_pob <- df_modelo %>%
+  filter(!is.na(Gran_Ciudad), !is.na(eleccion_sostenible_factor)) %>%
+  count(Gran_Ciudad, eleccion_sostenible_factor) %>%
+  group_by(Gran_Ciudad) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup() %>%
+  # Cruzamos los datos con los pesos calculados
+  left_join(peso_pob, by = "Gran_Ciudad") %>%
+  mutate(Gran_Ciudad_Label = factor(Gran_Ciudad, 
+                                    levels = c(0, 1), 
+                                    labels = c("Ciudad Med./Pequeña", "Gran Ciudad")))
+
+# 3) Graficamos el Mosaico con anchos proporcionales reales
+plot_mekko_pob <- ggplot(pct_pob, aes(x = Gran_Ciudad_Label, y = pct, fill = eleccion_sostenible_factor, width = w_pob)) +
+  geom_col(position = "stack", color = "white", alpha = 0.9) +
+  # Añadimos los porcentajes y las frecuencias absolutas (n) centradas en los bloques
+  geom_text(aes(label = sprintf("%1.1f%%\n(n = %d)", pct, n)),
+            position = position_stack(vjust = 0.5), size = 3.5, fontface = "bold", color = "black") +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = c("Domicilio (No Sost.)" = "#E63946", "Física/C&C (Sost.)" = "#3CB371")) +
+  labs(
+    x     = "Tamaño del municipio",
+    y     = "Porcentaje de Elección de Canal",
+    fill  = "Canal Elegido:",
+    title = "Elección sostenible según tamaño del municipio",
+    subtitle = "La anchura de cada barra es proporcional al tamaño muestral",
+   ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 13, margin = margin(b=5)),
+    plot.subtitle = element_text(size = 9, color = "gray30", margin = margin(b=12)),
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 0, hjust = 0.5, size = 9, face = "plain", color = "black"),
+    axis.text.y = element_text(size = 9, color = "black"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# Desplegar el gráfico limpio en pantalla
+print(plot_mekko_pob)
+
+```
+
+
+## Contrastes de Hipótesis Base
+
+
+```{r}
+cat("\n--- Chi-Cuadrado: Género vs ELECCIÓN SOSTENIBLE ---\n")
+tabla_genero <- table(df_modelo$S2_sexo, df_modelo$eleccion_sostenible_factor)
+print(chisq.test(tabla_genero))
+
+cat("\n--- Chi-Cuadrado: Edad vs ELECCIÓN SOSTENIBLE ---\n")
+tabla_edad <- table(df_modelo$CUOTA_EDAD, df_modelo$eleccion_sostenible_factor)
+print(chisq.test(tabla_edad))
+
+cat("\n--- Chi-Cuadrado: Tamaño Poblacional vs ELECCIÓN SOSTENIBLE ---\n")
+tabla_poblacion <- table(droplevels(df_modelo$S3_poblacion), df_modelo$eleccion_sostenible_factor)
+print(chisq.test(tabla_poblacion))
+
+cat("\n--- Chi-Cuadrado: Gran Ciudad vs ELECCIÓN SOSTENIBLE ---\n")
+tabla_poblacion <- table((df_modelo$Gran_Ciudad), df_modelo$eleccion_sostenible_factor)
+print(chisq.test(tabla_poblacion))
+
+# PRUEBAS T-STUDENT Y ANOVA
+cat("\n--- T-STUDENT: GÉNERO VS CONCIENCIA AMBIENTAL ---\n")
+df_tstudent <- df_modelo %>% filter(S2_sexo %in% c("Femenino", "Masculino"))
+print(t.test(conciencia_ambiental_media ~ S2_sexo, data = df_tstudent))
+
+cat("\n--- T-STUDENT: GÉNERO VS IMPACIENCIAL ---\n")
+print(t.test(gratificacion_media ~ S2_sexo, data = df_tstudent))
+
+cat("\n--- T-STUDENT: GÉNERO VS SHOWROOMING ---\n")
+print(t.test(mala_conciencia_media ~ S2_sexo, data = df_tstudent))
+
+cat("\n--- T-STUDENT: GÉNERO VS SENSIBILIDAD PRECIO ---\n")
+print(t.test(sensibilidad_precio_media ~ S2_sexo, data = df_tstudent))
+
+cat("\n--- ANOVA: EDAD VS CONCIENCIA AMBIENTAL ---\n")
+print(summary(aov(conciencia_ambiental_media ~ CUOTA_EDAD, data = df_modelo)))
+
+cat("\n--- ANOVA: EDAD VS IMPACIENCIA ---\n")
+print(summary(aov(gratificacion_media ~ CUOTA_EDAD, data = df_modelo)))
+
+cat("\n--- ANOVA: EDAD VS SHOWROOMING ---\n")
+print(summary(aov(mala_conciencia_media ~ CUOTA_EDAD, data = df_modelo)))
+
+cat("\n--- ANOVA: EDAD VS SENSIBILIDAD PRECIO ---\n")
+print(summary(aov(sensibilidad_precio_media ~ CUOTA_EDAD, data = df_modelo)))
+
+cat("\n--- ANOVA: TAMAÑO POBLACIONAL VS CONCIENCIA AMBIENTAL ---\n")
+df_pob <- df_modelo %>% filter(!is.na(S3_poblacion) & S3_poblacion != "No lo sé") %>% mutate(S3_poblacion = droplevels(factor(S3_poblacion)))
+print(summary(aov(conciencia_ambiental_media ~ S3_poblacion, data = df_pob)))
+
+cat("\n--- ANOVA: TAMAÑO POBLACIONAL VS IMPACIENCIA ---\n")
+print(summary(aov(gratificacion_media ~ S3_poblacion, data = df_pob)))
+
+cat("\n--- ANOVA: TAMAÑO POBLACIONAL VS SHOWROOMING ---\n")
+print(summary(aov(mala_conciencia_media ~ S3_poblacion, data = df_pob)))
+
+cat("\n--- ANOVA: TAMAÑO POBLACIONAL VS SENSIBILIDAD PRECIO ---\n")
+print(summary(aov(sensibilidad_precio_media ~ S3_poblacion, data = df_pob)))
+```
+
+## Intensidad de la Intención de Compra
+
+```{r}
+# ANÁLISIS DE LA INTENSIDAD DE COMPRA (PREGUNTA 6) VS PSICOLOGÍA
+
+cat("\n--- CORRELACIONES: PSICOLOGÍA VS INTENCIÓN (LIKERT 1-7) ---\n")
+# Seleccionamos las variables psicológicas y las intenciones (P6)
+df_correlacion_p6 <- df_modelo %>%
+  select(
+    `1. Conciencia Ambiental` = conciencia_ambiental_media,
+    `2. Impaciencia` = gratificacion_media,
+    `3. Sensibilidad Precio` = sensibilidad_precio_media,
+    `4. Culpa por Showrooming` = mala_conciencia_media,
+    `Intención Tienda (P6_1)` = P6_1_intencion_tienda,
+    `Intención C&C (P6_2)` = P6_2_intencion_cc,
+    `Intención Domicilio (P6_3)` = P6_3_intencion_online
+  )
+
+# Calculamos la matriz de correlación (usamos pairwise para ignorar los NAs del C&C en escenarios A y B)
+matriz_p6 <- cor(df_correlacion_p6, use = "pairwise.complete.obs")
+print(round(matriz_p6[1:4, 5:7], 3)) # Mostramos solo el cruce que nos interesa
+```
+
+
+```{r}
+# GRÁFICO DE BARRAS: INTENCIÓN MEDIA POR ESCENARIO EXPERIMENTAL
+
+# Calculamos las medias de P6 para cada uno de los 4 escenarios
+df_p6_medias <- df_modelo %>%
+  group_by(escenario_id) %>%
+  summarise(
+    `Tienda Física` = mean(P6_1_intencion_tienda, na.rm = TRUE),
+    `Click & Collect` = mean(P6_2_intencion_cc, na.rm = TRUE),
+    `Envío Domicilio` = mean(P6_3_intencion_online, na.rm = TRUE)
+  ) %>%
+  pivot_longer(cols = -escenario_id, names_to = "Canal", values_to = "Media_Intencion") %>%
+  # Quitamos los NAs que salen en C&C para los escenarios A y B
+  filter(!is.na(Media_Intencion))
+
+
+# Dibujamos el gráfico comparativo
+plot_p6_escenarios <- ggplot(df_p6_medias, aes(x = escenario_id, y = Media_Intencion, fill = Canal)) +
+  geom_col(position = position_dodge(width = 0.8), color = "black", alpha = 0.85, width = 0.7) +
+  geom_text(aes(label = round(Media_Intencion, 2)), 
+            position = position_dodge(width = 0.8), vjust = -0.5, fontface = "bold", size = 3.5) +
+  scale_fill_manual(values = c("Tienda Física" = "#E9C46A", "Click & Collect" = "#2A9D8F", "Envío Domicilio" = "#E63946")) +
+  scale_y_continuous(limits = c(0, 7), breaks = 1:7) +
+  labs(
+    title = "Intensidad de la Intención de Compra por Escenario",
+    subtitle = "Puntuación media en escala Likert (1-7)",
+    x = "Escenario Experimental (A, B, C, D)",
+    y = "Intención Media (P6)",
+    fill = "Canal Evaluado:"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14), legend.position = "top")
+
+print(plot_p6_escenarios)
+
+
+
+```
+
+# Comportamiento Ecológico y Flujo de Persuasión 
+
+## Mapeo del Flujo de Decisión.
+
+```{r}
+# PREPARAR DATOS PARA EL GRÁFICO (Origen, Destino y Conteo)
+
+df_flujo <- df_modelo %>%
+  filter(!is.na(perfil_persuasion_detallado)) %>% # Quitamos NAs por seguridad
+  mutate(
+    # Definimos la FASE 1: ¿Qué eligieron al principio de todo?
+    Fase1 = case_when(
+      P5_eleccion_canal == "1" ~ "Inicio: Tienda",
+      escenario_id %in% c("C", "D") & P5_eleccion_canal == "2" ~ "Inicio: C&C",
+      (escenario_id %in% c("A", "B") & P5_eleccion_canal == "2") | 
+      (escenario_id %in% c("C", "D") & P5_eleccion_canal == "3") ~ "Inicio: Domicilio",
+      TRUE ~ "Otro"
+    ),
+    # La FASE 2 es la variable creada
+    Fase2 = perfil_persuasion_detallado
+  ) %>%
+  # Agrupamos y contamos cuántos hacen cada ruta
+  group_by(Fase1, Fase2) %>%
+  summarise(n = n(), .groups = "drop")
+
+
+df_flujo <- df_flujo %>%
+  mutate(Fase2 = case_when(
+    Fase2 == "3. Persuadidos a C&C Lento (Súper-Eco)" ~ "3. Persuadidos a C&C Lento",
+    TRUE ~ Fase2
+  ))
+
+# DIBUJAR EL GRÁFICO (Alluvial Plot)
+
+flujo <- ggplot(df_flujo, aes(axis1 = Fase1, axis2 = Fase2, y = n)) +
+  # Dibujamos las "olas" o flujos coloreados por donde empezaron
+  geom_alluvium(aes(fill = Fase1), width = 1/3, alpha = 0.6) +
+  # Dibujamos las cajas blancas
+  geom_stratum(width = 1/3, fill = "white", color = "black") +
+  # Añadimos el texto con el nombre de la categoría y el número de personas (n)
+  geom_text(
+  stat = "stratum",
+  aes(label = case_when(
+    after_stat(count) >= 15 ~ paste0(after_stat(stratum),
+                                     "\n(n = ", after_stat(count), ")"),
+    TRUE ~ as.character(after_stat(stratum))
+  )),
+  size = 3,
+  fontface = "bold"
+) +
+  # Colores para la fase inicial
+  scale_fill_manual(values = c("Inicio: Domicilio" = "#E63946", "Inicio: C&C" = "#F4A261", "Inicio: Tienda" = "#2A9D8F")) +
+  scale_x_discrete(limits = c("Elección Inicial", "Decisión Final tras Persuasión"), expand = c(.1, .1)) +
+  labs(
+    title = "Evolución de la elección del canal de entrega tras la intervención ambiental",
+    y = "Número de Consumidores"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none", panel.grid = element_blank(), axis.text.y = element_blank(),plot.title = element_text(face = "bold", size = 14),)
+
+print(flujo)
+
+```
+
+
+
+## El Perfil del Persuadido
+
+```{r}
+# TEST DE MCNEMAR (ANÁLISIS INTRA-SUJETO)
+
+# Extraemos solo el primer carácter (el número del 1 al 5) para que sea a prueba de fallos
+grupo_perfil <- substr(df_modelo$perfil_persuasion_detallado, 1, 1)
+
+# 1. ANTES DE LA PERSUASIÓN: 
+# Solo eran sostenibles los del grupo "1" (Tienda o C&C a la primera).
+Antes <- ifelse(grupo_perfil == "1", "Sostenible", "Domicilio")
+
+# 2. DESPUÉS DE LA PERSUASIÓN:
+# Son sostenibles los que ya lo eran (1), los que cambiaron de canal (2 y 3) 
+# y los que aceptaron el retraso ecológico en casa (4)
+Despues <- ifelse(grupo_perfil %in% c("1", "2", "3", "4"), "Sostenible", "Domicilio")
+
+# 3. CREAR TABLA FORZANDO EL ORDEN
+Antes <- factor(Antes, levels = c("Domicilio", "Sostenible"))
+Despues <- factor(Despues, levels = c("Domicilio", "Sostenible"))
+
+tabla_mcnemar <- table(Antes = Antes, Despues = Despues)
+
+# 4. IMPRIMIR RESULTADOS
+cat("\n--- TABLA DE TRANSICIÓN 2x2 ---\n")
+print(tabla_mcnemar)
+
+cat("\n--- TEST DE MCNEMAR ---\n")
+print(mcnemar.test(tabla_mcnemar))
+```
+```{r}
+# TEST DE PROPORCIONALIDAD: ACEPTACIÓN DEL RETRASO ECOLÓGICO (7 DÍAS)
+
+# 1. Definición de la muestra basada en las frecuencias reales extraídas
+n_persuandidos <- 133  # Total de sujetos convertidos por el nudge
+x_espera_7d    <- 96   # Persuados a Esperar Domicilio (76) + C&C Lento (20)
+
+# 2. Cálculo descriptivo de la proporción muestral (p-gorro)
+p_hat <- x_espera_7d / n_persuandidos
+cat("Proporción muestral observada (p-gorro):", round(p_hat, 4), 
+    "(", round(p_hat * 100, 2), "%)\n")
+
+# 3. Ejecución del Test de Proporcionalidad de una muestra
+test_proporcionalidad <- prop.test(
+  x = x_espera_7d, 
+  n = n_persuandidos, 
+  p = 0.50, 
+  alternative = "greater", 
+  correct = TRUE # Aplicamos la corrección de continuidad de Yates para mayor robustez
+)
+
+# 4. Visualización completa del output estadístico
+print(test_proporcionalidad)
+```
+
+
+```{r}
+# ANÁLISIS BIVARIANTE: ANOVA 
+
+# 1. Excluimos a los que ya eran sostenibles desde el principio
+df_anova <- df_modelo %>%
+  filter(!perfil_persuasion_detallado %in% c("1. Sostenible a la 1a", NA)) %>%
+  mutate(perfil_persuasion_detallado = as.factor(perfil_persuasion_detallado))
+
+cat("\n--- 1. ANOVA: CONCIENCIA AMBIENTAL MEDIA ---\n")
+anova_conciencia <- aov(conciencia_ambiental_media ~ perfil_persuasion_detallado, data = df_anova)
+print(summary(anova_conciencia))
+
+cat("\n--- 2. ANOVA: MALA CONCIENCIA MEDIA ---\n")
+anova_mala_conciencia <- aov(mala_conciencia_media ~ perfil_persuasion_detallado, data = df_anova)
+print(summary(anova_mala_conciencia))
+
+cat("\n--- 3. ANOVA: GRATIFICACIÓN INMEDIATA MEDIA ---\n")
+anova_gratificacion <- aov(gratificacion_media ~ perfil_persuasion_detallado, data = df_anova)
+print(summary(anova_gratificacion))
+
+cat("\n--- 4. ANOVA: SENSIBILIDAD AL PRECIO MEDIA ---\n")
+anova_sensib_precio <- aov(sensibilidad_precio_media ~ perfil_persuasion_detallado, data = df_anova)
+print(summary(anova_sensib_precio))
+
+
+
+```
+
+```{r}
+cat("\n--- PRUEBA DE TUKEY ---\n")
+tukey_conciencia <- TukeyHSD(anova_conciencia)
+print(tukey_conciencia)
+```
+
+
+```{r}
+df_intra <- df_anova
+```
+
+
+
+```{r}
+# DEMOGRAFÍA VS PERSUASIÓN (PRUEBAS CHI-CUADRADO)
+
+cat("\n--- 1. CHI-CUADRADO: GÉNERO VS PERSUASIÓN ---\n")
+df_tstudent <- df_intra %>% filter(S2_sexo %in% c("Femenino", "Masculino"))
+tabla_sexo <- table(df_tstudent$S2_sexo, df_tstudent$perfil_persuasion_detallado)
+print(chisq.test(tabla_sexo))
+
+cat("\n--- 2. CHI-CUADRADO: EDAD (CUOTA) VS PERSUASIÓN ---\n")
+tabla_edad <- table(df_intra$CUOTA_EDAD, df_intra$perfil_persuasion_detallado)
+# Aviso: Si hay rangos de edad con muy poca gente, R te dará un "Warning" aquí. 
+# Es normal, ignóralo o agrupa edades si es necesario.
+print(chisq.test(tabla_edad))
+
+cat("\n--- 3. CHI-CUADRADO: TAMAÑO POBLACIONAL VS PERSUASIÓN ---\n")
+df_pob <- df_intra %>% 
+  filter(!is.na(S3_poblacion) & S3_poblacion != "No lo sé") %>% 
+  mutate(S3_poblacion = droplevels(factor(S3_poblacion)))
+
+tabla_pob <- table(df_pob$Gran_Ciudad, df_pob$perfil_persuasion_detallado)
+print(chisq.test(tabla_pob))
+```
+```{r}
+# ==============================================================================
+# TFG: ANÁLISIS AGREGADO DE CHI-CUADRADO (PERSUADIDOS VS. RESISTENTES)
+# ==============================================================================
+library(dplyr)
+
+cat("\n[INFO] Recodificando la variable de persuasión en formato binario...\n")
+
+# Creamos la macro-variable binaria
+df_intra_agregado <- df_intra %>%
+  mutate(
+    macro_persuasion = case_when(
+      perfil_persuasion_detallado == "5. Resistentes Absolutos" ~ "Resistente",
+      TRUE                                        ~ "Persuadido" # Agrupa todos los perfiles sostenibles
+    )
+  )
+
+# --- 1. CHI-CUADRADO: GÉNERO VS PERSUASIÓN AGREGADA ---
+cat("\n--- 1. CHI-CUADRADO: GÉNERO VS PERSUASIÓN (AGREGADO) ---\n")
+df_genero_limpio <- df_intra_agregado %>% filter(S2_sexo %in% c("Femenino", "Masculino"))
+tabla_sexo_agregado <- table(df_genero_limpio$S2_sexo, df_genero_limpio$macro_persuasion)
+
+print(tabla_sexo_agregado) # Muestra la tabla de frecuencias brutas para control
+print(chisq.test(tabla_sexo_agregado))
+
+
+# --- 2. CHI-CUADRADO: EDAD (CUOTA) VS PERSUASIÓN AGREGADA ---
+cat("\n--- 2. CHI-CUADRADO: EDAD (CUOTA) VS PERSUASIÓN (AGREGADO) ---\n")
+tabla_edad_agregado <- table(df_intra_agregado$CUOTA_EDAD, df_intra_agregado$macro_persuasion)
+
+print(tabla_edad_agregado)
+print(chisq.test(tabla_edad_agregado))
+
+
+# --- 3. CHI-CUADRADO: TAMAÑO POBLACIONAL (GRAN CIUDAD) VS PERSUASIÓN AGREGADA ---
+cat("\n--- 3. CHI-CUADRADO: GRAN CIUTAT VS PERSUASIÓN (AGREGADO) ---\n")
+tabla_pob_agregado <- table(df_intra_agregado$Gran_Ciudad, df_intra_agregado$macro_persuasion)
+
+print(tabla_pob_agregado)
+print(chisq.test(tabla_pob_agregado))
+```
+
+
+
+```{r}
+# AUDITORÍA DE MUESTRA PARA EL MODELO DE PERSUASIÓN
+
+cat("\n--- DISTRIBUCIÓN ABSOLUTA DE LA EDAD EN LA SUBMUESTRA ---\n")
+
+tabla_auditoria <- table(df_intra$CUOTA_EDAD, df_intra$perfil_persuasion_detallado)
+print(addmargins(tabla_auditoria))
+
+print(round(prop.table(tabla_edad, margin = 1) * 100, 2))
+
+tabla_auditoria <- table(df_intra$S3_poblacion, df_intra$perfil_persuasion_detallado)
+print(addmargins(tabla_auditoria))
+
+print(round(prop.table(tabla_edad, margin = 1) * 100, 2))
+```
+
+# Modelo Predictivo 1: Elección Inicial
+
+## Especificación y Selección del Modelo 
+
+```{r}
+df_modelo <- df_modelo %>%
+  mutate(
+    target = as.numeric(eleccion_sostenible), 
+    precio_caro = ifelse(escenario_id %in% c("B", "D"), 1, 0),
+    ofrece_cc = ifelse(escenario_id %in% c("C", "D"), 1, 0),
+  ) %>%
+  drop_na(target, precio_caro, ofrece_cc)
+
+# 1. Definimos el modelo completo con todas las variables candidatas
+modelo_completo <- glm(target ~ precio_caro + 
+                         ofrece_cc +
+                         z_conciencia_amb + 
+                         z_sensib_precio + 
+                         z_gratificacion + 
+                         z_mala_conciencia +
+                       # Variables demográficas de control
+                       CUOTA_EDAD + S2_sexo + Gran_Ciudad +
+                       
+                        z_gratificacion:CUOTA_EDAD +   
+                        z_conciencia_amb:CUOTA_EDAD +  
+                        z_mala_conciencia:S2_sexo + 
+                         
+                      precio_caro:z_sensib_precio,  
+                       family = binomial(link = "logit"), 
+                       data = df_modelo)
+
+# 2. Ejecutamos el algoritmo Stepwise en ambas direcciones (Both ways)
+modelo_step_both <- step(modelo_completo, direction = "both", trace = 1)
+
+# 3. Visualizamos el modelo final ganador seleccionado por el AIC
+summary(modelo_step_both)
+
+# 4. Extraemos las Odds Ratios del modelo final
+exp(coef(modelo_step_both))
+```
+
+
+
+
+```{r}
+# GRÁFICO DE INTERACCIÓN: IMPACIENCIA x EDAD
+
+# 1. Calculamos las predicciones marginales
+preds_interaccion <- ggpredict(
+  modelo_step_both, 
+  terms = c("z_gratificacion [all]", "CUOTA_EDAD")
+)
+
+# 2. Dibujamos el gráfico
+plot_interaccion <- ggplot(preds_interaccion, aes(x = x, y = predicted, color = group, fill = group)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2, color = NA) +
+  
+  scale_color_manual(values = c("18-30" = "#E63946", "31-50" = "#F4A261", "51-65" = "#2A9D8F")) +
+  scale_fill_manual(values = c("18-30" = "#E63946", "31-50" = "#F4A261", "51-65" = "#2A9D8F")) +
+  
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  
+  labs(
+  title = "Efecto moderador de la edad sobre la relación entre gratificación inmediata y elección sostenible",
+  x = "Gratificación inmediata (z-score)",
+  y = "Probabilidad estimada de elección sostenible",
+  color = "Grupo de edad",
+  fill = "Grupo de edad"
+)+
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom"
+  )
+
+print(plot_interaccion)
+
+```
+
+
+
+
+```{r}
+cat("\n--- PRUEBA DE HOSMER-LEMESHOW (CALIBRACIÓN DEL MODELO) ---\n")
+prueba_hl <- hoslem.test(modelo_step_both$y, fitted(modelo_step_both), g = 10)
+print(prueba_hl)
+```
+## Análisis de Coeficientes Estandarizados (Forest Plot).
+
+```{r}
+# FOREST PLOT DEL MODELO 1
+
+coef_resumen <- as.data.frame(summary(modelo_step_both)$coefficients)
+coef_resumen$Variable <- rownames(coef_resumen)
+
+df_forest <- coef_resumen %>%
+  filter(Variable != "(Intercept)") %>%
+  rename(Estimacion = Estimate, SE = `Std. Error`, p_valor = `Pr(>|z|)`) %>%
+  mutate(
+    Limite_Inf = Estimacion - 1.96 * SE, Limite_Sup = Estimacion + 1.96 * SE,
+    Significativo = case_when(
+      p_valor < 0.05 ~ "Sí (p < 0.05)",
+      p_valor < 0.10 ~ "Tendencia (p < 0.10)",
+      TRUE ~ "No (p > 0.05)"
+    ),
+    Nombre_Limpio = case_when( Variable == "ofrece_cc" ~ "Disponibilidad de Click-and-Collect", Variable == "precio_caro" ~ "Diferencia de precio (+20 €)", Variable == "z_mala_conciencia" ~ "Mala conciencia showrooming (Z)", Variable == "z_gratificacion" ~ "Gratificación inmediata (Z)", Variable == "z_sensib_precio" ~ "Sensibilidad al precio (Z)", Variable == "z_conciencia_amb" ~ "Conciencia ambiental (Z)", TRUE ~ Variable )
+  )
+
+forest <- ggplot(df_forest, aes(x = reorder(Nombre_Limpio, Estimacion), y = Estimacion, color = Significativo)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 1) +
+  geom_pointrange(aes(ymin = Limite_Inf, ymax = Limite_Sup), size = 1.2, linewidth = 1.5) +
+  coord_flip() +
+  scale_color_manual(values = c("No (p > 0.05)" = "grey60", "Tendencia (p < 0.10)" = "#E9C46A", "Sí (p < 0.05)" = "#2A9D8F")) +
+  labs( title = "Coeficientes estimados del Modelo 1", subtitle = "Intervalos de confianza al 95%", x = "", y = expression(beta), color = "Significación" ) +
+  theme_minimal() + theme(plot.title = element_text(face = "bold", size = 14),axis.text.y = element_text(face = "bold", size = 10, color = "black"), legend.position = "bottom")
+
+print(forest)
+
+
+```
+
+
+## Capacidad Predictiva (Curva ROC, AUC y Matriz de Confusión).
+
+```{r}
+# BONDAD DE AJUSTE (ROC, CONFUSIÓN Y MÉTRICAS)
+
+df_modelo$prob_final <- predict(modelo_step_both, type = "response")
+roc_obj <- roc(response = df_modelo$target, predictor = df_modelo$prob_final)
+
+pdf(file = "figures/fig_5_24_curva_roc_modelo1_cas.pdf", width = 6, height = 5.5)
+
+plot(roc_obj, legacy.axes = TRUE, col = "#2A9D8F", lwd = 3,
+     main = paste0("Curva ROC del Modelo 1 (AUC = ", round(auc(roc_obj), 3), ")"))
+
+dev.off()
+
+df_modelo$pred_class <- factor(ifelse(df_modelo$prob_final >= 0.5, 1, 0), levels = c(0, 1))
+
+cat("\n--- MATRIZ DE CONFUSIÓN ---\n")
+CrossTable(x = df_modelo$target, y = df_modelo$pred_class, prop.chisq = FALSE, prop.t = FALSE, prop.r = FALSE)
+
+cm <- table(Actual = df_modelo$target, Predicho = df_modelo$pred_class)
+TN <- cm["0","0"]; FP <- cm["0","1"]
+FN <- cm["1","0"]; TP <- cm["1","1"]
+  
+accuracy    <- (TP + TN) / sum(cm)
+sensitivity <- TP / (TP + FN) 
+specificity <- TN / (TN + FP) 
+precision   <- TP / (TP + FP)
+f1_score    <- 2 * precision * sensitivity / (precision + sensitivity)
+
+cat("\n--- MÉTRICAS DE RENDIMIENTO ---\n")
+data.frame(
+  Metrica = c("Exactitud Global (Accuracy)", "Sensibilidad (Recall)", "Especificidad", "Precisión", "F1 Score"),
+  Valor   = c(accuracy, sensitivity, specificity, precision, f1_score)
+)
+```
+
+```{r}
+#  DIAGNÓSTICO VIF (Multicolinealidad) — Modelo 1
+
+vif_modelo1 <- vif(modelo_step_both)
+cat("\n--- VIF DEL MODELO BASE (> 5 = problema, > 10 = grave) ---\n")
+print(round(vif_modelo1, 3))
+
+cat("\nVariables con VIF > 5:\n")
+print(vif_modelo1[vif_modelo1 > 5])
+
+# VALIDACIÓN CRUZADA K-FOLD (k=10) — Modelo 1
+df_modelo$target_factor <- factor(df_modelo$target, 
+                                    levels = c(0, 1), 
+                                    labels = c("NoSost", "Sost"))
+
+# Configuración del control: 10-fold, repetido 3 veces para estabilidad
+ctrl <- trainControl(
+  method          = "repeatedcv",
+  number          = 10,
+  repeats         = 3,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+# Entrenamos con los mismos predictores del modelo ganador
+modelo_cv1 <- train(
+  target_factor ~ precio_caro + ofrece_cc + z_sensib_precio + z_gratificacion + z_mala_conciencia + CUOTA_EDAD + S2_sexo + z_gratificacion:CUOTA_EDAD,
+  data    = df_modelo,
+  method  = "glm",
+  family  = binomial(),
+  trControl = ctrl,
+  metric  = "ROC"
+)
+
+cat("\n--- RESULTADOS K-FOLD (10-fold, 3 repeticiones) ---\n")
+print(modelo_cv1$results)
+
+cat("\n--- AUC MEDIA K-FOLD vs AUC MUESTRA COMPLETA ---\n")
+cat("AUC k-fold (generalización):", 
+    round(modelo_cv1$results$ROC, 3), "\n")
+cat("AUC muestra completa (optimista):", 
+    round(auc(roc_obj), 3), "\n")
+cat("Diferencia (sesgo de sobreajuste):", 
+    round(auc(roc_obj) - modelo_cv1$results$ROC, 3), "\n")
+```
+
+
+## Árbol de Decisión CART .
+
+```{r}
+# ÁRBOL DE DECISIÓN (CART) - RUTAS DEL CONSUMIDOR
+arbol_decision <- rpart(target ~ precio_caro + ofrece_cc + 
+                        z_conciencia_amb + z_sensib_precio + 
+                        z_gratificacion + z_mala_conciencia + 
+                        CUOTA_EDAD + S2_sexo, 
+                        data = df_modelo, method = "class", 
+                        control = rpart.control(cp = 0.02))
+
+# rpart.plot(arbol_decision, type = 3, extra = 104, fallen.leaves = TRUE, 
+           # box.palette = c("#E76F51", "#2A9D8F"), shadow.col = "gray", 
+           # main = "Árbol de Decisión: Segmentación del Consumidor Omnicanal")
+
+```
+
+
+# Modelo Predictivo 2: El Cambio de Opinión
+
+## Especificación del Modelo de Persuasión 
+
+```{r}
+
+df_intra <- df_modelo %>%
+  # Quitamos a los que ya eran verdes
+  filter(!perfil_persuasion_detallado %in% c("1. Sostenible a la 1a", NA)) %>%
+  # Creamos el target dentro del dataframe de forma segura
+  mutate(target_persuasion_real = ifelse(perfil_persuasion_detallado == "5. Resistentes Absolutos", 0, 1))
+
+cat("\n--- NUEVA AUDITORÍA DE LA VARIABLE A PREDECIR ---\n")
+print(table(df_intra$target_persuasion_real))
+
+df_intra <- df_intra %>%
+  # 1. Filtramos a los que no saben dónde viven
+  filter(!is.na(S3_poblacion) & S3_poblacion != "No lo se") %>%
+  
+  # 2. Convertimos el factor a su número de nivel interno (del 1 al 7)
+  mutate(S3_num = as.numeric(S3_poblacion))
+  
+# 3. Lanzamos el modelo con todas las variables
+modelo_persuasion_masivo_final <- glm(target_persuasion_real ~ 
+                                  precio_caro + ofrece_cc + 
+                                  z_conciencia_amb + z_mala_conciencia + 
+                                  z_gratificacion + z_sensib_precio +
+                                  CUOTA_EDAD + S2_sexo + Gran_Ciudad, 
+                                family = binomial(link = "logit"), 
+                                data = df_intra)
+
+modelo_definitivo <- step(modelo_persuasion_masivo_final, direction = "both", trace = 0)
+
+summary(modelo_definitivo)
+```
+
+
+```{r}
+cat("\n--- PRUEBA DE HOSMER-LEMESHOW (CALIBRACIÓN DEL MODELO) ---\n")
+prueba_hl <- hoslem.test(modelo_definitivo$y, fitted(modelo_definitivo), g = 10)
+print(prueba_hl)
+```
+
+```{r}
+hoslem.test(modelo_definitivo$y, fitted(modelo_definitivo), g=5)
+```
+
+## Análisis de Coeficientes Estandarizados (Forest Plot).
+
+```{r}
+# FOREST PLOT DEL MODELO GANADOR (BASE)
+
+coef_resumen <- as.data.frame(summary(modelo_definitivo)$coefficients)
+coef_resumen$Variable <- rownames(coef_resumen)
+
+df_forest <- coef_resumen %>%
+  filter(Variable != "(Intercept)") %>%
+  rename(Estimacion = Estimate, SE = `Std. Error`, p_valor = `Pr(>|z|)`) %>%
+  mutate(
+    Limite_Inf = Estimacion - 1.96 * SE, Limite_Sup = Estimacion + 1.96 * SE,
+    Significativo = case_when(
+      p_valor < 0.05 ~ "Sí (p < 0.05)",
+      p_valor < 0.10 ~ "Tendencia (p < 0.10)",
+      TRUE ~ "No (p > 0.05)"
+    ),
+    Nombre_Limpio = case_when(
+      Variable == "ofrece_cc" ~ "1. Ofrece Click & Collect (Nudge)",
+      Variable == "z_mala_conciencia" ~ "2. Culpa Showrooming (Z)",
+      Variable == "z_conciencia_amb" ~ "Conciencia Amb. (Z)",
+      Variable == "z_gratificacion" ~ "4. Impaciencia (Z)",
+      Variable == "z_sensib_precio" ~ "5. Sensibilidad Precio (Z)",
+      Variable == "precio_caro" ~ "6. Sobrecoste 20€ (Nudge)",
+      TRUE ~ Variable
+    )
+  )
+
+ggplot(df_forest, aes(x = reorder(Nombre_Limpio, Estimacion), y = Estimacion, color = Significativo)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 1) +
+  geom_pointrange(aes(ymin = Limite_Inf, ymax = Limite_Sup), size = 1.2, linewidth = 1.5) +
+  coord_flip() +
+  scale_color_manual(values = c("No (p > 0.05)" = "grey60", "Tendencia (p < 0.10)" = "#E9C46A", "Sí (p < 0.05)" = "#2A9D8F")) +
+  labs(title = "Impacto de Variables en la Elección del Canal Sostenible",
+       subtitle = "Modelo Logístico Base", x = "", y = "Peso Predictivo (Coeficiente)", color = "¿Es Significativo?") +
+  theme_minimal() + theme(plot.title = element_text(face = "bold", size = 14), legend.position = "bottom")
+```
+
+## Capacidad Predictiva (Curva ROC, AUC y Matriz de Confusión).
+
+```{r}
+# BONDAD DE AJUSTE (ROC, CONFUSIÓN Y MÉTRICAS)
+
+df_intra$prob_final <- predict(modelo_definitivo, type = "response")
+roc_obj <- roc(response = df_intra$target_persuasion_real, predictor = df_intra$prob_final)
+
+pdf(file = "figures/fig_5_27_curva_roc_modelo2_val.pdf", width = 6, height = 5.5)
+plot(roc_obj, legacy.axes = TRUE, col = "#2A9D8F", lwd = 3,
+     main = paste0("Corba ROC del Model 2 (AUC = ", round(auc(roc_obj), 3), ")"))
+dev.off()
+
+df_intra$pred_class <- factor(ifelse(df_intra$prob_final >= 0.5, 1, 0), levels = c(0, 1))
+
+cat("\n--- MATRIZ DE CONFUSIÓN ---\n")
+CrossTable(x = df_intra$target_persuasion_real, y = df_intra$pred_class, prop.chisq = FALSE, prop.t = FALSE, prop.r = FALSE)
+
+cm <- table(Actual = df_intra$target_persuasion_real, Predicho = df_intra$pred_class)
+TN <- cm["0","0"]; FP <- cm["0","1"]
+FN <- cm["1","0"]; TP <- cm["1","1"]
+  
+accuracy    <- (TP + TN) / sum(cm)
+sensitivity <- TP / (TP + FN) 
+specificity <- TN / (TN + FP) 
+precision   <- TP / (TP + FP)
+f1_score    <- 2 * precision * sensitivity / (precision + sensitivity)
+
+cat("\n--- MÉTRICAS DE RENDIMIENTO ---\n")
+data.frame(
+  Metrica = c("Exactitud Global (Accuracy)", "Sensibilidad (Recall)", "Especificidad", "Precisión", "F1 Score"),
+  Valor   = c(accuracy, sensitivity, specificity, precision, f1_score)
+)
+```
+
+```{r}
+# DIAGNÓSTICO VIF — Modelo 2 (Persuasión)
+# Con un solo predictor el VIF no aplica.
+# Reportamos el pseudo-R² de McFadden como medida de ajuste.
+pseudo_r2_m2 <- 1 - (247.14 / 263.66)
+cat("Pseudo-R² McFadden (Modelo 2):", round(pseudo_r2_m2, 3), "\n")
+
+# VALIDACIÓN CRUZADA K-FOLD — Modelo 2
+df_intra$target_factor2 <- factor(df_intra$target_persuasion_real,
+                                    levels = c(0, 1),
+                                    labels = c("Resistente", "Persuadido"))
+ctrl_small <- trainControl(
+  method          = "repeatedcv",
+  number          = 5,
+  repeats         = 5,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+modelo_cv2 <- train(
+  target_factor2 ~ z_conciencia_amb,
+  data      = df_intra,
+  method    = "glm",
+  family    = binomial(),
+  trControl = ctrl_small,
+  metric    = "ROC"
+)
+
+# Recalculamos las probabilidades con el modelo definitivo correcto
+df_intra$prob_final_correcto <- predict(modelo_definitivo, 
+                                         type = "response")
+
+# Ahora calculamos el ROC sobre la muestra completa
+roc_obj2_correcto <- roc(response  = df_intra$target_persuasion_real, 
+                          predictor = df_intra$prob_final_correcto)
+
+cat("AUC muestra completa (modelo definitivo):", 
+    round(auc(roc_obj2_correcto), 3), "\n")
+
+# Y la diferencia 
+cat("Diferencia k-fold vs muestra completa:", 
+    round(auc(roc_obj2_correcto) - modelo_cv2$results$ROC, 3), "\n")
+
+
+```
+
+## Árbol de Decisión CART 
+
+```{r}
+# ÁRBOL DE DECISIÓN (FASE 2 - PERSUASIÓN)
+
+arbol_persuasion <- rpart(target_persuasion_real ~ ofrece_cc + z_conciencia_amb + 
+                          z_gratificacion + Gran_Ciudad, 
+                          data = df_intra, method = "class", 
+                          control = rpart.control(cp = 0.02))
+
+
+```
+
+# Implicaciones Gerenciales y Comerciales
+
+## Impacto en la Probabilidad.
+
+
+```{r}
+# ODDS RATIOS Y EFECTOS MARGINALES MODDELO 1
+
+cat("\n--- ODDS RATIOS ---\n")
+print(tidy(modelo_step_both, conf.int = TRUE, exponentiate = TRUE))
+
+cat("\n--- EFECTOS MARGINALES PROMEDIO (AME) \n")
+efectos_marginales <- margins(modelo_step_both, data = df_modelo)
+print(summary(efectos_marginales))
+```
+
+
+```{r}
+# ODDS RATIOS Y EFECTOS MARGINALES MODELO 2
+
+cat("\n--- ODDS RATIOS ---\n")
+print(tidy(modelo_definitivo, conf.int = TRUE, exponentiate = TRUE))
+
+cat("\n--- EFECTOS MARGINALES PROMEDIO (AME) ---\n")
+efectos_marginales <- margins(modelo_definitivo, data = df_intra)
+print(summary(efectos_marginales))
+```
+
+## Simulación Predictiva de Escenarios 
+
+```{r}
+# SIMULACIÓN DE ESCENARIOS DE NEGOCIO
+
+# 1. Creamos el dataframe con un "Consumidor Estándar"
+escenarios_simulacion <- data.frame(
+  Perfil = c("1. Barata SIN C&C", "2. Cara (+20€) SIN C&C", 
+             "3. Barata CON C&C", "4. Cara (+20€) CON C&C"),
+  
+  # Variables Experimentales
+  precio_caro = c(0, 1, 0, 1), 
+  ofrece_cc   = c(0, 0, 1, 1), 
+  
+  # Variables Psicológicas (Estandarizadas a 0 = Media poblacional)
+  z_conciencia_amb = 0, 
+  z_sensib_precio = 0, 
+  z_gratificacion = 0, 
+  z_mala_conciencia = 0, 
+  
+  # Variables Demográficas Base+
+  CUOTA_EDAD = factor("18-30", levels = c("18-30", "31-50", "51-65")),
+  S2_sexo = factor("Femenino", levels = c("Femenino", "Masculino"))
+)
+
+# 2. Hacemos la predicción sobre el modelo 1
+escenarios_simulacion$Probabilidad <- predict(modelo_step_both, 
+                                              newdata = escenarios_simulacion, 
+                                              type = "response")
+
+tabla_simulacion <- escenarios_simulacion %>%
+  mutate(Prob_Sostenible = paste0(round(Probabilidad * 100, 1), " %")) %>%
+  select(Perfil, Prob_Sostenible)
+
+print(tabla_simulacion)
+```
+
+
+
